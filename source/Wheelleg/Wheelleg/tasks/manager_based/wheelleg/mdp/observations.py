@@ -13,6 +13,7 @@ import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi
 
 
 if TYPE_CHECKING:
@@ -161,6 +162,76 @@ def wheel_speed_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     return asset.data.joint_vel[:, asset_cfg.joint_ids]
+
+
+def drive_motor_state_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Return absolute drive motor angles and angular velocities.
+
+    Observation layout for the configured drive joints:
+    [q_0..q_n, qd_0..qd_n]. The angles are wrapped to [-pi, pi] so the
+    policy sees a continuous revolute-joint state instead of unbounded turns.
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = wrap_to_pi(asset.data.joint_pos[:, asset_cfg.joint_ids])
+    joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.cat((joint_pos, joint_vel), dim=-1)
+
+
+def wheel_end_effector_state_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Return wheel/end-effector planar state in the base frame.
+
+    The wheel links are the five-bar end effectors in this model. Using their
+    simulated pose gives the policy direct local coordinates after the linkage
+    kinematics are resolved by Isaac Sim. Observation layout per wheel is
+    [x_b, z_b, vx_b, vz_b], flattened left then right.
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    body_vel_w = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]
+    num_bodies = body_pos_w.shape[1]
+
+    root_pos_w = asset.data.root_pos_w.unsqueeze(1)
+    root_vel_w = asset.data.root_lin_vel_w.unsqueeze(1)
+    root_quat_w = asset.data.root_quat_w.unsqueeze(1).expand(-1, num_bodies, -1).reshape(-1, 4)
+
+    rel_pos_w = (body_pos_w - root_pos_w).reshape(-1, 3)
+    rel_vel_w = (body_vel_w - root_vel_w).reshape(-1, 3)
+    rel_pos_b = quat_apply_inverse(root_quat_w, rel_pos_w).view(env.num_envs, num_bodies, 3)
+    rel_vel_b = quat_apply_inverse(root_quat_w, rel_vel_w).view(env.num_envs, num_bodies, 3)
+
+    planar_state = torch.stack((rel_pos_b[..., 0], rel_pos_b[..., 2], rel_vel_b[..., 0], rel_vel_b[..., 2]), dim=-1)
+    return planar_state.reshape(env.num_envs, -1)
+
+
+def action_history_obs(env: ManagerBasedRLEnv, history_length: int = 5) -> torch.Tensor:
+    """Return a short history of recently applied actions.
+
+    The newest action is stored first. The history lets the policy detect cases
+    where wheel/hip commands changed but the end-effector state did not, which
+    is a useful cue that a wheel is blocked by a stair and should be lifted.
+    """
+
+    action = env.action_manager.action
+    action_dim = action.shape[1]
+    needs_init = not hasattr(env, "wheelleg_action_history")
+    if not needs_init:
+        needs_init = env.wheelleg_action_history.shape[1:] != (history_length, action_dim)
+    if needs_init:
+        env.wheelleg_action_history = torch.zeros(env.num_envs, history_length, action_dim, device=env.device)
+        env.wheelleg_action_history_step = -1
+
+    reset_mask = env.episode_length_buf <= 1
+    env.wheelleg_action_history[reset_mask] = 0.0
+
+    current_step = int(env.common_step_counter)
+    if env.wheelleg_action_history_step != current_step:
+        env.wheelleg_action_history[:, 1:] = env.wheelleg_action_history[:, :-1].clone()
+        env.wheelleg_action_history[:, 0] = action
+        env.wheelleg_action_history_step = current_step
+
+    return env.wheelleg_action_history.reshape(env.num_envs, -1)
 
 
 def base_height_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

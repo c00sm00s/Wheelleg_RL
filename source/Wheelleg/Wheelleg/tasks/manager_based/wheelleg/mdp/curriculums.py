@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.terrains import TerrainImporter
 
@@ -28,86 +27,43 @@ def _as_env_ids_tensor(env: ManagerBasedRLEnv, env_ids: Sequence[int] | slice | 
     return torch.tensor(env_ids, dtype=torch.long, device=env.device)
 
 
-def _ensure_path_length_buffers(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> None:
-    """Create per-env path length buffers if this is the first call."""
-
-    asset: Articulation = env.scene[asset_cfg.name]
-    if not hasattr(env, "wheelleg_path_length"):
-        env.wheelleg_path_length = torch.zeros(env.num_envs, device=env.device)
-    if not hasattr(env, "wheelleg_prev_root_xy"):
-        env.wheelleg_prev_root_xy = asset.data.root_pos_w[:, :2].clone()
-
-
-def reset_path_length(
-    env: ManagerBasedRLEnv,
-    env_ids: Sequence[int] | slice | None,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> None:
-    """Reset the per-episode path-length odometer after root-state reset."""
-
-    asset: Articulation = env.scene[asset_cfg.name]
-    _ensure_path_length_buffers(env, asset_cfg)
-    ids = _as_env_ids_tensor(env, env_ids)
-    env.wheelleg_path_length[ids] = 0.0
-    env.wheelleg_prev_root_xy[ids] = asset.data.root_pos_w[ids, :2]
-
-
-def update_path_length(
-    env: ManagerBasedRLEnv,
-    env_ids: Sequence[int] | slice | None,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> None:
-    """Accumulate scalar XY path length traveled during the episode."""
-
-    asset: Articulation = env.scene[asset_cfg.name]
-    _ensure_path_length_buffers(env, asset_cfg)
-    ids = _as_env_ids_tensor(env, env_ids)
-    current_xy = asset.data.root_pos_w[ids, :2]
-    step_distance = torch.norm(current_xy - env.wheelleg_prev_root_xy[ids], dim=1)
-    env.wheelleg_path_length[ids] += step_distance
-    env.wheelleg_prev_root_xy[ids] = current_xy
-
-
 def terrain_levels_vel(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Three-stage terrain curriculum using scalar traveled path length.
+    """Four-stage terrain curriculum based on episode timeout success.
 
-    Stage 0 uses terrain column 0 (flat), stage 1 uses column 1 (rough), and
-    stage 2 uses column 2 (small stairs). Successful envs move up one stage
-    when their accumulated XY path length passes the threshold; envs that travel
-    less than half of commanded path length move down one stage.
+    Stage 0 uses row 0 / column 0 (flat), stage 1 uses row 0 / column 1
+    (rough), stage 2 uses row 0 / column 2 (down stairs), and stage 3 uses
+    row 0 / column 3 (up stairs). An environment moves up one stage only when
+    the previous episode ended by ``time_out``. If it terminates early, it moves
+    down one stage to relearn on easier ground.
     """
 
-    asset: Articulation = env.scene[asset_cfg.name]
     terrain: TerrainImporter = env.scene.terrain
-    command = env.command_manager.get_command("base_velocity")
-
     if terrain.terrain_origins is None:
         return torch.zeros((), device=env.device)
 
-    if not isinstance(env_ids, torch.Tensor):
-        env_ids = torch.tensor(env_ids, dtype=torch.long, device=env.device)
+    ids = _as_env_ids_tensor(env, env_ids)
+    _, num_cols = terrain.terrain_origins.shape[:2]
+    max_stage = min(num_cols, 4) - 1
 
-    num_rows, num_cols = terrain.terrain_origins.shape[:2]
-    max_stage = min(num_rows, num_cols, 3) - 1
+    # During the very first env.reset(), ManagerBasedRLEnv has not stepped yet,
+    # so these buffers do not exist. Start every env on flat stage 0.
+    if not hasattr(env, "reset_time_outs") or not hasattr(env, "reset_terminated"):
+        stage = torch.zeros_like(ids)
+    else:
+        move_up = env.reset_time_outs[ids]
+        move_down = env.reset_terminated[ids] & ~move_up
+        stage = terrain.terrain_types[ids] + 1 * move_up - 1 * move_down
+        stage = torch.clamp(stage, min=0, max=max_stage)
 
-    _ensure_path_length_buffers(env, asset_cfg)
-    path_length = env.wheelleg_path_length[env_ids]
-    move_up = path_length > terrain.cfg.terrain_generator.size[0] / 2
-    move_down = path_length < torch.norm(command[env_ids, :2], dim=1) * env.max_episode_length_s * 0.5
-    move_down *= ~move_up
-
-    stage = terrain.terrain_levels[env_ids] + 1 * move_up - 1 * move_down
-    stage = torch.clamp(stage, min=0, max=max_stage)
-
-    # Keep row and column equal to the stage index:
-    # 0 -> flat, 1 -> rough, 2 -> small stairs.
-    terrain.terrain_levels[env_ids] = stage
-    terrain.terrain_types[env_ids] = stage
-    terrain.env_origins[env_ids] = terrain.terrain_origins[stage, stage]
+    # Keep row fixed at 0 and use the column as the course stage:
+    # col 0 -> flat, col 1 -> rough, col 2 -> down stairs, col 3 -> up stairs.
+    terrain.terrain_levels[ids] = 0
+    terrain.terrain_types[ids] = stage
+    terrain.env_origins[ids] = terrain.terrain_origins[0, stage]
 
     return torch.mean(stage.float())
 

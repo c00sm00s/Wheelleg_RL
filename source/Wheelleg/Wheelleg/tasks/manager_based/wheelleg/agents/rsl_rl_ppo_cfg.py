@@ -15,9 +15,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 200
     experiment_name = "wheelleg_locomotion"
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,
-        actor_obs_normalization=False,
-        critic_obs_normalization=False,
+        init_noise_std=0.5,
+        noise_std_type="log",
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
         actor_hidden_dims=[128, 128, 64],
         critic_hidden_dims=[128, 128, 64],
         activation="elu",
@@ -29,7 +30,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=3.0e-4,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,

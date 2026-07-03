@@ -9,4 +9,4 @@ from .rsl_rl_ppo_cfg import PPORunnerCfg as BasePPORunnerCfg
 @configclass
 class Terrian_PPORunnerCfg(BasePPORunnerCfg):
     experiment_name = "wheelleg_terrian"
-    max_iterations = 5000
+    max_iterations = 2000
