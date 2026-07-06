@@ -14,6 +14,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 3000
     save_interval = 200
     experiment_name = "wheelleg_locomotion"
+    clip_actions = 1.0
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=0.5,
         noise_std_type="log",

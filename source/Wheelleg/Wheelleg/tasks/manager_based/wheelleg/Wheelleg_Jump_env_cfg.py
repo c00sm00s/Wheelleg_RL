@@ -55,14 +55,14 @@ WHEEL_BODY_CFG = SceneEntityCfg(
 
 @configclass
 class JumpActionsCfg(BaseActionsCfg):
-    """Expose active hip and wheel efforts for jump control.
+    """Expose active hip and wheel position targets for jump control.
 
     The knee joints belong to the leg linkage and are left passive/damped in
     the actuator setup. Driving them independently makes the front/rear links
     scissor through each other instead of compressing the leg.
     """
 
-    joint_effort = mdp.JointEffortActionCfg(
+    joint_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[
             "L_hip_front_joint",
@@ -72,14 +72,11 @@ class JumpActionsCfg(BaseActionsCfg):
             "L_wheel_joint",
             "R_wheel_joint",
         ],
-        scale={
-            # Jumping is produced by the five-bar hip pairs. Give the policy
-            # enough authority to compress and extend the legs quickly.
-            ".*hip.*": 16.0,
-            # Keep wheel effort small in this task so rolling is not the easy
-            # local optimum that beats learning a real takeoff.
-            ".*wheel.*": 0.45,
-        },
+        scale={".*hip.*": 0.82905, ".*wheel.*": math.pi},
+        offset={".*hip.*": -0.21815, ".*wheel.*": 0.0},
+        clip={".*hip.*": (-1.0472, 0.6109), ".*wheel.*": (-math.pi, math.pi)},
+        preserve_order=True,
+        use_default_offset=False,
     )
 
 
@@ -308,8 +305,8 @@ class WheellegJumpEnvCfg(WheellegEnvCfg):
                 ],
                 effort_limit_sim=24.0,
                 velocity_limit_sim=14.0,
-                stiffness=0.0,
-                damping=0.3,
+                stiffness=30.0,
+                damping=1.0,
             ),
             "passive_knees": ImplicitActuatorCfg(
                 joint_names_expr=[
@@ -330,7 +327,7 @@ class WheellegJumpEnvCfg(WheellegEnvCfg):
                 ],
                 effort_limit_sim=0.8,
                 velocity_limit_sim=31.416,
-                stiffness=0.0,
+                stiffness=1.0,
                 damping=0.2,
             ),
         }

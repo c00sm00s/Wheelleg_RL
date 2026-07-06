@@ -86,7 +86,7 @@ class WheellegSceneCfg(InteractiveSceneCfg):
                 ],
                 effort_limit_sim=0.9,
                 velocity_limit_sim=31.416,
-                stiffness=0.0,
+                stiffness=1.0,
                 damping=0.2,
             ),
         },
@@ -113,7 +113,7 @@ class WheellegSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_effort = mdp.JointEffortActionCfg(
+    joint_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[
             "L_hip_front_joint",
@@ -123,7 +123,11 @@ class ActionsCfg:
             "L_wheel_joint",
             "R_wheel_joint",
         ],
-        scale=1.0,
+        scale={".*hip.*": 0.82905, ".*wheel.*": math.pi},
+        offset={".*hip.*": -0.21815, ".*wheel.*": 0.0},
+        clip={".*hip.*": (-1.0472, 0.6109), ".*wheel.*": (-math.pi, math.pi)},
+        preserve_order=True,
+        use_default_offset=False,
     )
 
 

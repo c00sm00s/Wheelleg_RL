@@ -35,10 +35,10 @@ def terrain_levels_vel(
     """Four-stage terrain curriculum based on episode timeout success.
 
     Stage 0 uses row 0 / column 0 (flat), stage 1 uses row 0 / column 1
-    (rough), stage 2 uses row 0 / column 2 (down stairs), and stage 3 uses
-    row 0 / column 3 (up stairs). An environment moves up one stage only when
-    the previous episode ended by ``time_out``. If it terminates early, it moves
-    down one stage to relearn on easier ground.
+    (rough), stage 2 uses row 0 / column 2 (pyramid up stairs), and stage 3
+    uses row 0 / column 3 (single-direction human-style up stairs). The old
+    down-stair/forward-pyramid stage was removed because it encouraged stiff
+    downhill strategies instead of proactive lifting.
     """
 
     terrain: TerrainImporter = env.scene.terrain
@@ -60,7 +60,8 @@ def terrain_levels_vel(
         stage = torch.clamp(stage, min=0, max=max_stage)
 
     # Keep row fixed at 0 and use the column as the course stage:
-    # col 0 -> flat, col 1 -> rough, col 2 -> down stairs, col 3 -> up stairs.
+    # col 0 -> flat, col 1 -> rough, col 2 -> up stairs,
+    # col 3 -> straight human-style up stairs.
     terrain.terrain_levels[ids] = 0
     terrain.terrain_types[ids] = stage
     terrain.env_origins[ids] = terrain.terrain_origins[0, stage]

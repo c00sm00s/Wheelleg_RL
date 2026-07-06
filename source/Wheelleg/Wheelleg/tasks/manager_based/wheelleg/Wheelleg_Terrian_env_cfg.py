@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
 import isaaclab.terrains.trimesh.mesh_terrains as mesh_terrain_fns
+import trimesh
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -24,6 +26,7 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
@@ -37,12 +40,22 @@ from .mdp.rewards import (
     joint_velocity_limit_penalty,
     leg_joint_limit_margin_penalty,
     leg_joint_motion_reward,
+    wheel_clearance_difference_penalty,
     gait_alternating_contact_reward,
     gait_both_legs_participation_reward,
     gait_lateral_drift_penalty,
     gait_swing_clearance_reward,
     gait_swing_drag_penalty,
+    history_blocked_drag_penalty,
+    history_blocked_lift_velocity_reward,
+    history_blocked_swing_clearance_reward,
     safe_base_height_l2,
+    stage_blocked_asymmetric_wheel_lift_reward,
+    stage_track_ang_vel_z_exp,
+    stage_track_lin_vel_xy_exp,
+    stage3_heading_alignment_reward,
+    stage3_split_stair_lagging_lift_reward,
+    stage3_stair_progress_reward,
     stance_wheel_lateral_slip_penalty,
     wheel_not_stop_penalty,
     wheel_rolling_consistency,
@@ -70,10 +83,26 @@ ACTUATED_JOINT_CFG = SceneEntityCfg(
         "R_wheel_joint",
     ],
 )
+BASE_BODY_CFG = SceneEntityCfg("robot", body_names=["base_link"])
 WHEEL_BODY_CFG = SceneEntityCfg("robot", body_names=["L_wheel_link", "R_wheel_link"])
 WHEEL_CONTACT_CFG = SceneEntityCfg("contact_sensor", body_names=["L_wheel_link", "R_wheel_link"])
-LEFT_WHEEL_SCANNER_CFG = SceneEntityCfg("left_wheel_scanner")
-RIGHT_WHEEL_SCANNER_CFG = SceneEntityCfg("right_wheel_scanner")
+LEG_LINK_CONTACT_CFG = SceneEntityCfg(
+    "contact_sensor",
+    body_names=[
+        "L_thigh_front_link",
+        "L_calf_front_link",
+        "L_thigh_rear_link",
+        "L_calf_rear_link",
+        "R_thigh_front_link",
+        "R_calf_front_link",
+        "R_thigh_rear_link",
+        "R_calf_rear_link",
+    ],
+)
+STAGE2_INDEX = 2
+# Final straight-stair curriculum column. The old down-stair/pyramid stage was
+# removed, so the straight stair is now column 3 in a four-stage curriculum.
+STAGE3_INDEX = 3
 
 
 def raised_inverted_pyramid_stairs_terrain(difficulty: float, cfg):
@@ -97,14 +126,91 @@ def raised_inverted_pyramid_stairs_terrain(difficulty: float, cfg):
 
 @configclass
 class MeshRaisedInvertedPyramidStairsTerrainCfg(terrain_gen.MeshInvertedPyramidStairsTerrainCfg):
-    """Inverted stairs shifted upward so stage3 never starts below world z=0."""
+    """Inverted stairs shifted upward so stage2 never starts below world z=0."""
 
     function = raised_inverted_pyramid_stairs_terrain
 
 
+def straight_stairs_terrain(difficulty: float, cfg):
+    """Generate a one-way +X stair course with the lowest walking surface at z=0."""
+
+    step_height = cfg.step_height_range[0] + difficulty * (cfg.step_height_range[1] - cfg.step_height_range[0])
+    terrain_center_y = 0.5 * cfg.size[1]
+    x0 = cfg.border_width + cfg.bottom_platform_width
+    meshes = [mesh_terrain_fns.make_plane(cfg.size, 0.0, center_zero=False)]
+
+    # Each box top is the walking surface. The bottom extends slightly below
+    # zero so all stair faces are closed meshes while the lowest surface remains
+    # at world height 0 after terrain placement.
+    base_thickness = cfg.base_thickness
+    for step_idx in range(1, cfg.num_steps + 1):
+        top_height = step_idx * step_height
+        box_dims = (cfg.step_width, cfg.stair_width, top_height + base_thickness)
+        box_pos = (
+            x0 + (step_idx - 0.5) * cfg.step_width,
+            terrain_center_y,
+            0.5 * (top_height - base_thickness),
+        )
+        meshes.append(trimesh.creation.box(box_dims, trimesh.transformations.translation_matrix(box_pos)))
+
+    top_height = cfg.num_steps * step_height
+    top_dims = (cfg.top_platform_width, cfg.stair_width, top_height + base_thickness)
+    top_pos = (
+        x0 + cfg.num_steps * cfg.step_width + 0.5 * cfg.top_platform_width,
+        terrain_center_y,
+        0.5 * (top_height - base_thickness),
+    )
+    meshes.append(trimesh.creation.box(top_dims, trimesh.transformations.translation_matrix(top_pos)))
+
+    origin = np.array([cfg.border_width + 0.5 * cfg.bottom_platform_width, terrain_center_y, 0.0])
+    return meshes, origin
+
+
+@configclass
+class MeshStraightStairsTerrainCfg(terrain_gen.SubTerrainBaseCfg):
+    """Single-direction stair terrain for stage3.
+
+    Tune these fields to change the human-style stair shape:
+    - ``step_height_range``: stair riser height. Use equal values for fixed height.
+    - ``step_width``: stair tread depth along +X.
+    - ``num_steps``: number of risers before the top platform.
+    - ``stair_width``: usable width in Y; leaving it should count as falling off.
+    """
+
+    function = straight_stairs_terrain
+
+    step_height_range: tuple[float, float] = (0.08, 0.08)
+    step_width: float = 0.35
+    num_steps: int = 10
+    stair_width: float = 2.0
+    bottom_platform_width: float = 2.0
+    top_platform_width: float = 2.0
+    border_width: float = 1.0
+    base_thickness: float = 0.20
+
+
+STAGE3_STAIRS_CFG = MeshStraightStairsTerrainCfg(
+    proportion=1.0,
+    step_height_range=(0.08, 0.08),
+    step_width=0.35,
+    num_steps=10,
+    stair_width=5.0,
+    bottom_platform_width=4.0,
+    top_platform_width=3.0,
+    border_width=0.5,
+)
+"""Stage3 exposed stair interface.
+
+Edit this object to tune the straight stair shape. Termination and command
+logic below reference the same values, so stair geometry and task bounds stay
+consistent.
+"""
+
+
 WHEELLEG_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
     # Four-stage curriculum with one row and four terrain-type columns.
-    # col 0 -> flat, col 1 -> rough, col 2 -> down stairs, col 3 -> up stairs.
+    # col 0 -> flat, col 1 -> rough, col 2 -> up stairs,
+    # col 3 -> single-direction human-style up stairs.
     # Isaac Lab uses rows as difficulty levels and columns as terrain types;
     # because we want exactly one difficulty per stage, this is 1x4 instead of 4x1.
     size=(16.0, 16.0),
@@ -126,27 +232,20 @@ WHEELLEG_TERRAINS_CFG = terrain_gen.TerrainGeneratorCfg(
             noise_step=0.01,
             border_width=0.25,
         ),
-        # Stage 2: start on the high center platform and go outward/downstairs.
-        # Larger step width keeps the total stair height reasonable on 16 m tiles.
-        "down_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
-            proportion=1.0,
-            step_height_range=(0.015, 0.055),
-            step_width=0.80,
-            platform_width=4.0,
-            border_width=1.0,
-            holes=False,
-        ),
-        # Stage 3: start on a 0 m center platform and go outward/upstairs.
+        # Stage 2: start on a 0 m center platform and go outward/upstairs.
         # The custom cfg shifts Isaac Lab's inverted stairs upward, so the
         # lowest point is not below world z=0 and base_too_low stays meaningful.
         "up_stairs": MeshRaisedInvertedPyramidStairsTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.015, 0.055),
-            step_width=0.80,
-            platform_width=4.0,
+            step_height_range=(0.015, 0.045),
+            step_width=0.90,
+            platform_width=6.0,
             border_width=1.0,
             holes=False,
         ),
+        # Stage 3: human-style straight stairs. Lowest walking surface is 0 m,
+        # and the only valid success direction is world +X.
+        "human_straight_up_stairs": STAGE3_STAIRS_CFG,
     },
 )
 
@@ -160,7 +259,7 @@ class WheellegTerrianSceneCfg(InteractiveSceneCfg):
         terrain_type="generator",
         terrain_generator=WHEELLEG_TERRAINS_CFG,
         # Start every env on row 0 / col 0, i.e. flat ground. The curriculum
-        # promotes successful envs through rough, down-stair, and up-stair stages.
+        # promotes successful envs through rough, up-stair, and straight-stair stages.
         max_init_terrain_level=0,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -182,27 +281,35 @@ class WheellegTerrianSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.UsdFileCfg(usd_path=str(ROBOT_USD_PATH), activate_contact_sensors=True),
         init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
         actuators={
-            "legs": ImplicitActuatorCfg(
+            "hips": ImplicitActuatorCfg(
                 joint_names_expr=[
                     "L_hip_front_joint",
-                    "L_knee_front_joint",
                     "L_hip_rear_joint",
-                    "L_knee_rear_joint",
                     "R_hip_front_joint",
-                    "R_knee_front_joint",
                     "R_hip_rear_joint",
-                    "R_knee_rear_joint",
                 ],
-                effort_limit_sim=9.0,
+                effort_limit_sim=12.0,
                 velocity_limit_sim=5.236,
                 stiffness=20.0,
                 damping=1.0,
+            ),
+            "passive_knees": ImplicitActuatorCfg(
+                joint_names_expr=[
+                    "L_knee_front_joint",
+                    "L_knee_rear_joint",
+                    "R_knee_front_joint",
+                    "R_knee_rear_joint",
+                ],
+                effort_limit_sim=12.0,
+                velocity_limit_sim=5.236,
+                stiffness=0.0,
+                damping=0.3,
             ),
             "wheels": ImplicitActuatorCfg(
                 joint_names_expr=["L_wheel_joint", "R_wheel_joint"],
                 effort_limit_sim=0.9,
                 velocity_limit_sim=31.416,
-                stiffness=0.0,
+                stiffness=1.0,
                 damping=0.2,
             ),
         },
@@ -218,21 +325,21 @@ class WheellegTerrianSceneCfg(InteractiveSceneCfg):
         mesh_prim_paths=["/World/ground"],
     )
 
-    # Local ground probes below each wheel. Stage3 swing rewards compare wheel
-    # height against these hits, so stair clearance is terrain-relative.
-    left_wheel_scanner = RayCasterCfg(
+    # Privileged foot-local terrain samples for the critic/teacher. These
+    # sensors are intentionally not part of the deployable policy observation.
+    left_foot_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/L_wheel_link",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.25)),
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
         ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.02, size=[0.02, 0.02]),
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.05, size=(0.6, 0.6)),
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
-    right_wheel_scanner = RayCasterCfg(
+    right_foot_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/R_wheel_link",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.25)),
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
         ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.02, size=[0.02, 0.02]),
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.05, size=(0.6, 0.6)),
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
@@ -256,7 +363,7 @@ class WheellegTerrianSceneCfg(InteractiveSceneCfg):
 class TerrianActionsCfg:
     """Actions for rough-terrain locomotion."""
 
-    joint_effort = mdp.JointEffortActionCfg(
+    joint_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=[
             "L_hip_front_joint",
@@ -266,9 +373,11 @@ class TerrianActionsCfg:
             "L_wheel_joint",
             "R_wheel_joint",
         ],
-        # Use most available hip authority for obstacle negotiation while keeping
-        # wheel effort bounded by the actuator limit.
-        scale={".*hip.*": 6.0, ".*wheel.*": 0.9},
+        scale={".*hip.*": 0.82905, ".*wheel.*": math.pi},
+        offset={".*hip.*": -0.21815, ".*wheel.*": 0.0},
+        clip={".*hip.*": (-1.0472, 0.6109), ".*wheel.*": (-math.pi, math.pi)},
+        preserve_order=True,
+        use_default_offset=False,
     )
 
 
@@ -276,7 +385,7 @@ class TerrianActionsCfg:
 class TerrianCommandsCfg:
     """Velocity commands with small initial range and larger curriculum target."""
 
-    base_velocity = mdp.UniformLevelVelocityCommandCfg(
+    base_velocity = mdp.StageAwareLevelVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(1.0e9, 1.0e9),
         rel_standing_envs=0.0,
@@ -284,21 +393,26 @@ class TerrianCommandsCfg:
         heading_command=False,
         debug_vis=True,
         ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            # Sample one forward speed at reset and keep it for the full episode.
-            # Lateral/yaw commands are fixed to zero so the robot cannot turn
-            # around or sidestep away from the stair task.
-            lin_vel_x=(0.20, 1.20),
-            lin_vel_y=(0.0, 0.0),
-            ang_vel_z=(0.0, 0.0),
+            # Stage0-2 sample random body-frame velocity commands at reset and
+            # hold them for the full episode. Stage3 overrides this with a
+            # world-frame +X uphill command inside StageAwareLevelVelocityCommand.
+            lin_vel_x=(-0.80, 0.80),
+            lin_vel_y=(-0.35, 0.35),
+            ang_vel_z=(-0.50, 0.50),
             heading=(-math.pi, math.pi),
         ),
         limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
-            # Command curriculum may widen only the forward-speed range.
-            lin_vel_x=(0.20, 1.20),
-            lin_vel_y=(0.0, 0.0),
-            ang_vel_z=(0.0, 0.0),
+            # Command curriculum may widen the stage0-2 random command range.
+            lin_vel_x=(-1.5, 1.5),
+            lin_vel_y=(-0.8, 0.8),
+            ang_vel_z=(-1.0, 1.0),
             heading=(-math.pi, math.pi),
         ),
+        stage3_index=STAGE3_INDEX,
+        stage3_world_direction=(1.0, 0.0),
+        stage3_lin_vel_x=(0.8, 1.5),
+        stage3_heading_control_stiffness=1.5,
+        stage3_ang_vel_z=(-0.1, 0.1),
     )
 
 
@@ -325,17 +439,57 @@ class TerrianObservationsCfg:
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05, noise=Unoise(n_min=-0.5, n_max=0.5))
         last_action = ObsTerm(func=mdp.last_action)
+        # Recent velocity tracking error lets the policy detect a sudden block:
+        # small error while rolling, then a sharp spike when the base is stopped.
+        velocity_error_history = ObsTerm(
+            func=mdp.velocity_tracking_error_history_obs,
+            params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot"), "history_length": 5},
+        )
+        # Global blind-walking memory. This lets the policy connect recent
+        # actuator changes with blocked-wheel and lift outcomes.
         action_history = ObsTerm(func=mdp.action_history_obs, params={"history_length": 5})
-        gait_phase = ObsTerm(func=mdp.gait_phase_obs, params={"gait_period": 0.8})
+        stage2_asymmetric_gait_phase = ObsTerm(
+            func=mdp.stage_asymmetric_gait_phase_obs,
+            params={
+                "stage": STAGE2_INDEX,
+                "gait_period": 0.75,
+                "swing_fraction": 0.35,
+                "blocked_latch_attr": "wheelleg_blocked_wheel_latch_min_stage_2",
+                "state_prefix": "wheelleg_stage2_blocked_asymmetric_gait",
+            },
+        )
+        gait_phase = None
         wheel_contact = ObsTerm(
             func=mdp.contact_state_obs,
             params={"sensor_cfg": WHEEL_CONTACT_CFG, "threshold": 1.0},
+        )
+        leg_link_contact = ObsTerm(
+            func=mdp.leg_link_contact_state_obs,
+            params={"sensor_cfg": LEG_LINK_CONTACT_CFG, "threshold": 1.0, "links_per_side": 4},
         )
         def __post_init__(self) -> None:
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    @configclass
+    class PrivilegedCfg(ObsGroup):
+        left_terrain = ObsTerm(
+            func=mdp.foot_height_scan,
+            params={"sensor_cfg": SceneEntityCfg("left_foot_scanner"), "offset": 0.5},
+            clip=(-1.0, 1.0),
+        )
+        right_terrain = ObsTerm(
+            func=mdp.foot_height_scan,
+            params={"sensor_cfg": SceneEntityCfg("right_foot_scanner"), "offset": 0.5},
+            clip=(-1.0, 1.0),
+        )
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     policy: PolicyCfg = PolicyCfg()
+    privileged: PrivilegedCfg = PrivilegedCfg()
 
 
 @configclass
@@ -343,12 +497,21 @@ class TerrianEventCfg:
     """Domain randomization and reset events for robust terrain learning."""
 
     reset_base = EventTerm(
-        func=mdp.reset_root_state_uniform,
+        func=mdp.reset_root_state_uniform_stage_yaw,
         mode="reset",
         params={
             # Sample inside the selected terrain tile instead of always starting
-            # at the exact origin. This exposes the policy to local roughness.
+            # at the exact origin. Stage3 keeps yaw aligned with the stair.
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-math.pi, math.pi)},
+            "stage_pose_ranges": {
+                # Stage2 is an outward-up inverted stair field. Keep resets near
+                # the enlarged center platform so the first ring is not touched
+                # immediately after reset.
+                str(STAGE2_INDEX): {"x": (-0.35, 0.35), "y": (-0.35, 0.35)},
+                # Stage3 is a +X straight stair course. Reset on the rear half
+                # of the bottom platform, well before the first riser.
+                str(STAGE3_INDEX): {"x": (-0.5, -0.5), "y": (-0.25, 0.25), "yaw": (-0.1, 0.1)},
+            },
             "velocity_range": {
                 "x": (-0.05, 0.05),
                 "y": (-0.05, 0.05),
@@ -357,6 +520,8 @@ class TerrianEventCfg:
                 "pitch": (-0.05, 0.05),
                 "yaw": (-0.05, 0.05),
             },
+            "stage": STAGE3_INDEX,
+            "stage_yaw_range": (-0.1, 0.1),
         },
     )
 
@@ -380,31 +545,56 @@ class TerrianRewardsCfg(BaseRewardsCfg):
 
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_exp,
-        weight=1.5,
-        params={"command_name": "base_velocity", "std": 0.35},
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": 0.45},
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_exp,
-        weight=0.75,
-        params={"command_name": "base_velocity", "std": 0.35},
+        weight=1.2,
+        params={"command_name": "base_velocity", "std": 0.45},
+    )
+    stage2plus_track_lin_vel_xy_exp = RewTerm(
+        func=stage_track_lin_vel_xy_exp,
+        weight=2.0,
+        params={"command_name": "base_velocity", "min_stage": STAGE2_INDEX, "std": 0.45},
+    )
+    stage2plus_track_ang_vel_z_exp = RewTerm(
+        func=stage_track_ang_vel_z_exp,
+        weight=0.8,
+        params={"command_name": "base_velocity", "min_stage": STAGE2_INDEX, "std": 0.45},
     )
     alive = RewTerm(func=mdp.is_alive, weight=0.5)
     terminating = RewTerm(func=mdp.is_terminated, weight=-2.0)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-2.5)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-2.0)
     # Keep the body upright, but do not over-penalize vertical motion: stairs
     # require the base to rise/fall while the legs absorb terrain height changes.
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.50)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.08)
     base_height_l2 = RewTerm(
         func=safe_base_height_l2,
-        weight=-0.80,
+        weight=-0.50,
         params={"target_height": 0.50, "sensor_cfg": SceneEntityCfg("height_scanner")},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.012)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.02)
     joint_torque_l2 = RewTerm(
         func=mdp.joint_torques_l2,
         weight=-1.0e-5,
         params={"asset_cfg": ACTUATED_JOINT_CFG},
+    )
+    joint_power_l1 = RewTerm(
+        func=mdp.joint_power_l1,
+        weight=-2.0e-6,
+        params={"asset_cfg": ACTUATED_JOINT_CFG},
+    )
+    joint_acc_l2 = RewTerm(
+        func=mdp.joint_acc_l2,
+        weight=-2.5e-7,
+        params={"asset_cfg": ACTUATED_JOINT_CFG},
+    )
+    base_lin_acc_l2 = RewTerm(
+        func=mdp.body_lin_acc_l2,
+        weight=-2.0e-4,
+        params={"asset_cfg": BASE_BODY_CFG},
     )
     joint_velocity_limits = RewTerm(
         func=joint_velocity_limit_penalty,
@@ -434,81 +624,204 @@ class TerrianRewardsCfg(BaseRewardsCfg):
         weight=-0.20,
         params={"asset_cfg": KNEE_JOINT_CFG, "margin": 0.75, "exponent": 4.0, "max_penalty": 4.0},
     )
+    wheel_clearance_difference = RewTerm(
+        func=wheel_clearance_difference_penalty,
+        weight=-0.25,
+        params={
+            "asset_cfg": WHEEL_BODY_CFG,
+            "left_sensor_cfg": SceneEntityCfg("left_foot_scanner"),
+            "right_sensor_cfg": SceneEntityCfg("right_foot_scanner"),
+            "wheel_radius": 0.0625,
+            "min_stage": STAGE2_INDEX,
+            "deadband": 0.16,
+            "std": 0.05,
+        },
+    )
 
-    # Global gait rewards: force a left/right swing-stance pattern on every
-    # terrain stage instead of waiting until stage3 to introduce leg lifting.
+    # Mild trot-style gait shaping. Keep these weaker than the terrain/blocking
+    # rewards so the robot can still break rhythm when climbing obstacles.
     gait_alternating_contact = RewTerm(
         func=gait_alternating_contact_reward,
-        weight=1.0,
+        weight=0.25,
         params={
             "command_name": "base_velocity",
             "sensor_cfg": WHEEL_CONTACT_CFG,
-            "gait_period": 0.8,
-            "double_support_width": 0.18,
+            "gait_period": 0.75,
+            "double_support_width": 0.14,
         },
     )
-    gait_swing_clearance = RewTerm(
-        func=gait_swing_clearance_reward,
-        weight=0.8,
-        params={
-            "command_name": "base_velocity",
-            "asset_cfg": WHEEL_BODY_CFG,
-            "left_sensor_cfg": LEFT_WHEEL_SCANNER_CFG,
-            "right_sensor_cfg": RIGHT_WHEEL_SCANNER_CFG,
-            "gait_period": 0.8,
-            "clearance_height": 0.14,
-            "wheel_radius": 0.10,
-        },
-    )
+    gait_swing_clearance = None
     gait_swing_drag = RewTerm(
         func=gait_swing_drag_penalty,
-        weight=-0.8,
+        weight=-0.20,
         params={
             "command_name": "base_velocity",
             "sensor_cfg": WHEEL_CONTACT_CFG,
-            "gait_period": 0.8,
+            "gait_period": 0.75,
             "force_scale": 20.0,
         },
     )
-    gait_both_legs_participation = RewTerm(
-        func=gait_both_legs_participation_reward,
-        weight=0.5,
-        params={
-            "command_name": "base_velocity",
-            "asset_cfg": WHEEL_BODY_CFG,
-            "sensor_cfg": WHEEL_CONTACT_CFG,
-            "left_sensor_cfg": LEFT_WHEEL_SCANNER_CFG,
-            "right_sensor_cfg": RIGHT_WHEEL_SCANNER_CFG,
-            "gait_period": 0.8,
-            "clearance_height": 0.12,
-            "wheel_radius": 0.10,
-        },
-    )
+    gait_both_legs_participation = None
     gait_lateral_drift = RewTerm(
         func=gait_lateral_drift_penalty,
         weight=-0.3,
         params={"command_name": "base_velocity"},
     )
-    stance_wheel_lateral_slip = RewTerm(
-        func=stance_wheel_lateral_slip_penalty,
-        weight=-0.25,
+    undesired_leg_contacts = RewTerm(
+        func=mdp.undesired_contacts_count,
+        weight=-1.5,
+        params={"sensor_cfg": LEG_LINK_CONTACT_CFG, "threshold": 1.0},
+    )
+    stance_wheel_lateral_slip = None
+    # History-triggered obstacle negotiation. Stage2 uses the asymmetric
+    # blocked gait below; stage3 clearance is measured as wheel-bottom height
+    # above foot-local ray terrain instead of analytic stair geometry.
+    history_blocked_swing_clearance = RewTerm(
+        func=history_blocked_swing_clearance_reward,
+        weight=1.25,
         params={
             "command_name": "base_velocity",
             "asset_cfg": WHEEL_BODY_CFG,
             "sensor_cfg": WHEEL_CONTACT_CFG,
+            "link_sensor_cfg": LEG_LINK_CONTACT_CFG,
             "gait_period": 0.8,
-            "max_penalty": 4.0,
+            "history_length": 5,
+            "lift_height": 0.10,
+            "wheel_radius": 0.0625,
+            "left_sensor_cfg": SceneEntityCfg("left_foot_scanner"),
+            "right_sensor_cfg": SceneEntityCfg("right_foot_scanner"),
+            "stage": STAGE3_INDEX,
+            "bottom_platform_width": STAGE3_STAIRS_CFG.bottom_platform_width,
+            "step_height": STAGE3_STAIRS_CFG.step_height_range[0],
+            "step_width": STAGE3_STAIRS_CFG.step_width,
+            "num_steps": STAGE3_STAIRS_CFG.num_steps,
+            "wheel_velocity_error_threshold": 0.25,
+            "horizontal_force_ratio_threshold": 0.4,
+            "horizontal_force_threshold": 1.0,
+            "wheel_spin_speed_threshold": 0.5,
+            "wheel_spin_forward_speed_threshold": 0.12,
+            "min_blocked_stage": STAGE3_INDEX,
         },
+    )
+    stage2_blocked_asymmetric_lift = RewTerm(
+        func=stage_blocked_asymmetric_wheel_lift_reward,
+        weight=0.75,
+        params={
+            "command_name": "base_velocity",
+            "stage": STAGE2_INDEX,
+            "asset_cfg": WHEEL_BODY_CFG,
+            "sensor_cfg": WHEEL_CONTACT_CFG,
+            "link_sensor_cfg": LEG_LINK_CONTACT_CFG,
+            "left_sensor_cfg": SceneEntityCfg("left_foot_scanner"),
+            "right_sensor_cfg": SceneEntityCfg("right_foot_scanner"),
+            "gait_period": 0.75,
+            "swing_fraction": 0.35,
+            "history_length": 5,
+            "min_command_speed": 0.1,
+            "contact_threshold": 1.0,
+            "wheel_velocity_error_threshold": 0.25,
+            "horizontal_force_ratio_threshold": 0.4,
+            "horizontal_force_threshold": 1.0,
+            "wheel_spin_speed_threshold": 0.5,
+            "wheel_spin_forward_speed_threshold": 0.12,
+            "height_margin": 0.035,
+            "height_std": 0.03,
+            "wheel_radius": 0.0625,
+            "min_base_height": 0.42,
+            "base_height_std": 0.05,
+            "min_forward_speed": 0.08,
+            "max_lift_height": 0.16,
+            "max_wheel_clearance_difference": 0.20,
+            "height_weight": 1.0,
+            "air_weight": 0.7,
+            "support_contact_weight": 0.3,
+            "state_prefix": "wheelleg_stage2_blocked_asymmetric_gait",
+        },
+    )
+    history_blocked_lift_velocity = RewTerm(
+        func=history_blocked_lift_velocity_reward,
+        weight=0.35,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": WHEEL_BODY_CFG,
+            "sensor_cfg": WHEEL_CONTACT_CFG,
+            "link_sensor_cfg": LEG_LINK_CONTACT_CFG,
+            "history_length": 5,
+            "target_lift_speed": 0.35,
+            "wheel_velocity_error_threshold": 0.25,
+            "horizontal_force_ratio_threshold": 0.4,
+            "horizontal_force_threshold": 1.0,
+            "wheel_spin_radius": 0.0625,
+            "wheel_spin_speed_threshold": 0.5,
+            "wheel_spin_forward_speed_threshold": 0.12,
+            "min_blocked_stage": 2,
+        },
+    )
+    history_blocked_drag = RewTerm(
+        func=history_blocked_drag_penalty,
+        weight=-1.0,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": WHEEL_BODY_CFG,
+            "sensor_cfg": WHEEL_CONTACT_CFG,
+            "link_sensor_cfg": LEG_LINK_CONTACT_CFG,
+            "gait_period": 0.8,
+            "history_length": 5,
+            "wheel_velocity_error_threshold": 0.25,
+            "horizontal_force_ratio_threshold": 0.4,
+            "horizontal_force_threshold": 1.0,
+            "wheel_spin_radius": 0.0625,
+            "wheel_spin_speed_threshold": 0.5,
+            "wheel_spin_forward_speed_threshold": 0.12,
+            "min_blocked_stage": 2,
+        },
+    )
+    stage3_stair_progress = RewTerm(
+        func=stage3_stair_progress_reward,
+        weight=2.0,
+        params={
+            "stage": STAGE3_INDEX,
+            "bottom_platform_width": STAGE3_STAIRS_CFG.bottom_platform_width,
+            "step_height": STAGE3_STAIRS_CFG.step_height_range[0],
+            "step_width": STAGE3_STAIRS_CFG.step_width,
+            "num_steps": STAGE3_STAIRS_CFG.num_steps,
+            "asset_cfg": WHEEL_BODY_CFG,
+            "wheel_radius": 0.0625,
+            "height_margin": 0.04,
+        },
+    )
+    stage3_split_stair_lagging_lift = RewTerm(
+        func=stage3_split_stair_lagging_lift_reward,
+        weight=1.0,
+        params={
+            "stage": STAGE3_INDEX,
+            "bottom_platform_width": STAGE3_STAIRS_CFG.bottom_platform_width,
+            "step_height": STAGE3_STAIRS_CFG.step_height_range[0],
+            "step_width": STAGE3_STAIRS_CFG.step_width,
+            "num_steps": STAGE3_STAIRS_CFG.num_steps,
+            "asset_cfg": WHEEL_BODY_CFG,
+            "left_sensor_cfg": SceneEntityCfg("left_foot_scanner"),
+            "right_sensor_cfg": SceneEntityCfg("right_foot_scanner"),
+            "wheel_radius": 0.0625,
+            "height_margin": 0.04,
+            "lift_height": 0.125,
+            "std": 0.05,
+        },
+    )
+    stage3_heading_alignment = RewTerm(
+        func=stage3_heading_alignment_reward,
+        weight=0.5,
+        params={"stage": STAGE3_INDEX, "target_heading": 0.0, "std": 0.35},
     )
 
     wheel_rolling = RewTerm(
         func=wheel_rolling_consistency,
-        weight=0.20,
-        params={"command_name": "base_velocity", "wheel_radius": 0.1, "asset_cfg": WHEEL_JOINT_CFG, "std": 0.35},
+        weight=0.35,
+        params={"command_name": "base_velocity", "wheel_radius": 0.0625, "asset_cfg": WHEEL_JOINT_CFG, "std": 0.45},
     )
     wheel_stop = RewTerm(
         func=wheel_not_stop_penalty,
-        weight=-0.10,
+        weight=-0.30,
         params={"command_name": "base_velocity", "asset_cfg": WHEEL_JOINT_CFG},
     )
 
@@ -525,6 +838,91 @@ class TerrianCurriculumCfg:
 
 
 @configclass
+class TerrianTerminationsCfg(TerminationsCfg):
+    """Terrain task termination terms.
+
+    Stage3 top completion is marked as a timeout-like success so the terrain
+    curriculum does not treat reaching the stair top as a failure.
+    """
+
+    stage3_reached_top = DoneTerm(
+        func=mdp.stage3_reached_top,
+        time_out=True,
+        params={
+            "stage": STAGE3_INDEX,
+            "bottom_platform_width": STAGE3_STAIRS_CFG.bottom_platform_width,
+            "step_width": STAGE3_STAIRS_CFG.step_width,
+            "num_steps": STAGE3_STAIRS_CFG.num_steps,
+            "stair_width": STAGE3_STAIRS_CFG.stair_width,
+            "fall_margin": 0.35,
+            "top_success_margin": 0.50,
+        },
+    )
+    stage3_fell_off_stairs = DoneTerm(
+        func=mdp.stage3_fell_off_stairs,
+        params={
+            "stage": STAGE3_INDEX,
+            "wheel_body_cfg": WHEEL_BODY_CFG,
+            "bottom_platform_width": STAGE3_STAIRS_CFG.bottom_platform_width,
+            "step_height": STAGE3_STAIRS_CFG.step_height_range[0],
+            "step_width": STAGE3_STAIRS_CFG.step_width,
+            "num_steps": STAGE3_STAIRS_CFG.num_steps,
+            "stair_width": STAGE3_STAIRS_CFG.stair_width,
+            "fall_margin": 0.35,
+            "top_success_margin": 0.50,
+            "height_check_start_step": 2,
+            # Wheel diameter is 0.125 m, so wheel bottom is wheel_link.z - 0.0625.
+            # Use wheel-bottom height instead of base height to avoid resetting
+            # normal stair-climb attempts where the base reaches forward before
+            # the wheels have climbed the riser.
+            "wheel_radius": 0.0625,
+            "wheel_height_margin": 0.03,
+            "require_both_wheels_below": True,
+            "enable_height_fall_check": True,
+        },
+    )
+    stage3_base_contact = DoneTerm(
+        func=mdp.stage3_base_stair_contact,
+        params={
+            "stage": STAGE3_INDEX,
+            "bottom_platform_width": STAGE3_STAIRS_CFG.bottom_platform_width,
+            "step_height": STAGE3_STAIRS_CFG.step_height_range[0],
+            "step_width": STAGE3_STAIRS_CFG.step_width,
+            "num_steps": STAGE3_STAIRS_CFG.num_steps,
+            "stair_width": STAGE3_STAIRS_CFG.stair_width,
+            "contact_margin": 0.01,
+            "base_half_length": 0.115,
+            "base_half_width": 0.09,
+            "base_bottom_z_offset": -0.03,
+            "lateral_margin": 0.05,
+        },
+    )
+    stage3_split_stair_stance_timeout = DoneTerm(
+        func=mdp.stage3_split_stair_stance_timeout,
+        params={
+            "stage": STAGE3_INDEX,
+            "wheel_body_cfg": WHEEL_BODY_CFG,
+            "bottom_platform_width": STAGE3_STAIRS_CFG.bottom_platform_width,
+            "step_height": STAGE3_STAIRS_CFG.step_height_range[0],
+            "step_width": STAGE3_STAIRS_CFG.step_width,
+            "num_steps": STAGE3_STAIRS_CFG.num_steps,
+            "wheel_radius": 0.0625,
+            "stance_height_margin": 0.04,
+            "max_duration_s": 1.2,
+        },
+    )
+    stage3_heading_error_timeout = DoneTerm(
+        func=mdp.stage3_heading_error_timeout,
+        params={
+            "stage": STAGE3_INDEX,
+            "target_heading": 0.0,
+            "max_heading_error": math.radians(60.0),
+            "max_duration_s": 1.0,
+        },
+    )
+
+
+@configclass
 class WheellegTerrianEnvCfg(WheellegEnvCfg):
     """WheelLeg locomotion environment over generated terrain."""
 
@@ -533,7 +931,7 @@ class WheellegTerrianEnvCfg(WheellegEnvCfg):
     actions: TerrianActionsCfg = TerrianActionsCfg()
     commands: TerrianCommandsCfg = TerrianCommandsCfg()
     rewards: TerrianRewardsCfg = TerrianRewardsCfg()
-    terminations: TerminationsCfg = TerminationsCfg()
+    terminations: TerrianTerminationsCfg = TerrianTerminationsCfg()
     events: TerrianEventCfg = TerrianEventCfg()
     curriculum: TerrianCurriculumCfg = TerrianCurriculumCfg()
 
@@ -542,14 +940,12 @@ class WheellegTerrianEnvCfg(WheellegEnvCfg):
         self.episode_length_s = 20.0
         self.scene.contact_sensor.update_period = self.sim.dt
         self.scene.height_scanner.update_period = self.decimation * self.sim.dt
-        self.scene.left_wheel_scanner.update_period = self.decimation * self.sim.dt
-        self.scene.right_wheel_scanner.update_period = self.decimation * self.sim.dt
+        self.scene.left_foot_scanner.update_period = self.decimation * self.sim.dt
+        self.scene.right_foot_scanner.update_period = self.decimation * self.sim.dt
         self.sim.physics_material = self.scene.terrain.physics_material
         self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
-        # Pull the recording camera back and up so train videos show the
-        # terrain strip and robot motion instead of a tight close-up.
-        self.viewer.eye = (24.0, -38.0, 18.0)
-        self.viewer.lookat = (0.0, 0.0, 0.5)
+        self.viewer.eye = (-4.0, 30.0, 1.5)
+        self.viewer.lookat = (0.0, 0.0, 0.0)
 
         # Terrain curriculum must be enabled on the generator itself; the
         # curriculum manager only calls ``terrain_levels_vel`` at reset.

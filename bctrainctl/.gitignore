@@ -1,0 +1,8 @@
+.idea
+build
+bctrainctl.egg-info
+.claude
+dist
+__pycache__/
+*.py[cod]
+.pytest_cache/

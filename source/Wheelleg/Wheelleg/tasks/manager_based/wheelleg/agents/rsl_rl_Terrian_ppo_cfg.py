@@ -10,3 +10,4 @@ from .rsl_rl_ppo_cfg import PPORunnerCfg as BasePPORunnerCfg
 class Terrian_PPORunnerCfg(BasePPORunnerCfg):
     experiment_name = "wheelleg_terrian"
     max_iterations = 2000
+    obs_groups = {"policy": ["policy"], "critic": ["policy", "privileged"]}

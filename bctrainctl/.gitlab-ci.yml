@@ -1,0 +1,136 @@
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - when: never
+
+default:
+  tags:
+    - docker
+
+stages:
+  - prepare
+  - build
+  - release
+
+check_version_change:
+  stage: prepare
+  image: python:3.12
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - pyproject.toml
+    - when: never
+  script:
+    - |
+      python - <<'PY'
+      import os
+      import subprocess
+      import tomllib
+      from pathlib import Path
+
+      current_data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+      package_name = current_data["project"]["name"]
+      package_version = current_data["project"]["version"]
+
+      before_sha = os.environ.get("CI_COMMIT_BEFORE_SHA", "")
+      zero_sha = "0" * 40
+      previous_version = ""
+      should_release = True
+
+      if before_sha and before_sha != zero_sha:
+          try:
+              previous_text = subprocess.check_output(
+                  ["git", "show", f"{before_sha}:pyproject.toml"],
+                  text=True,
+              )
+              previous_data = tomllib.loads(previous_text)
+              previous_version = previous_data["project"]["version"]
+              should_release = package_version != previous_version
+          except subprocess.CalledProcessError:
+              previous_version = ""
+              should_release = True
+
+      release_tag = f"v{package_version}-main.{os.environ['CI_PIPELINE_IID']}" if should_release else ""
+
+      Path("build.env").write_text(
+          "\n".join(
+              [
+                  f"PACKAGE_NAME={package_name}",
+                  f"PACKAGE_VERSION={package_version}",
+                  f"PREVIOUS_PACKAGE_VERSION={previous_version}",
+                  f"SHOULD_RELEASE={'true' if should_release else 'false'}",
+                  f"RELEASE_TAG={release_tag}",
+              ]
+          )
+          + "\n",
+          encoding="utf-8",
+      )
+
+      print(
+          f"current={package_version} previous={previous_version or '(none)'} "
+          f"should_release={should_release}"
+      )
+      PY
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 7 days
+
+build_wheel:
+  stage: build
+  image: python:3.12
+  variables:
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - pyproject.toml
+    - when: never
+  needs:
+    - job: check_version_change
+      artifacts: true
+  script:
+    - mkdir -p dist
+    - |
+      if [ "$SHOULD_RELEASE" != "true" ]; then
+        echo "project.version unchanged; skipping wheel build."
+        exit 0
+      fi
+    - python -m pip install --upgrade pip build
+    - python -m build --wheel
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days
+
+release_wheel:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - pyproject.toml
+    - when: never
+  needs:
+    - job: check_version_change
+      artifacts: true
+    - job: build_wheel
+      artifacts: true
+  script:
+    - |
+      if [ "$SHOULD_RELEASE" != "true" ]; then
+        echo "project.version unchanged; skipping release."
+        exit 0
+      fi
+    - glab auth login --hostname "$CI_SERVER_HOST" --job-token "$CI_JOB_TOKEN"
+    - >
+      glab release create "$RELEASE_TAG" dist/*.whl
+      --ref "$CI_COMMIT_SHA"
+      --name "${PACKAGE_NAME} ${PACKAGE_VERSION} (${CI_COMMIT_SHORT_SHA})"
+      --notes "Automated wheel release for main at ${CI_COMMIT_SHA}."
+      --use-package-registry
+      --package-name "${PACKAGE_NAME}-wheel"

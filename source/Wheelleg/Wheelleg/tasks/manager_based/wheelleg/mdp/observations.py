@@ -46,6 +46,91 @@ def leg_phase_mask(
     return left_phase, right_phase, left_swing, right_swing, left_stance, right_stance
 
 
+def asymmetric_gait_phase_mask(
+    env: ManagerBasedRLEnv,
+    gait_period: float,
+    swing_fraction: float = 0.35,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return an alternating clock with short swing and long stance phases.
+
+    Left swing occupies the first part of the cycle, right swing starts halfway
+    through the cycle, and the gaps are double-support windows.
+    """
+
+    time_s = env.episode_length_buf.to(dtype=torch.float32) * env.step_dt
+    cycle = torch.remainder(time_s / gait_period, 1.0)
+    swing_fraction = min(max(swing_fraction, 1.0e-3), 0.49)
+
+    left_swing = (cycle < swing_fraction).to(dtype=torch.float32)
+    right_swing = ((cycle >= 0.5) & (cycle < 0.5 + swing_fraction)).to(dtype=torch.float32)
+    left_stance = 1.0 - left_swing
+    right_stance = 1.0 - right_swing
+    phase = 2.0 * math.pi * cycle
+    return phase, torch.sin(phase), torch.cos(phase), left_swing, right_swing, left_stance, right_stance
+
+
+def blocked_asymmetric_gait_phase_mask(
+    env: ManagerBasedRLEnv,
+    blocked_gate: torch.Tensor,
+    gait_period: float,
+    swing_fraction: float = 0.35,
+    state_prefix: str = "wheelleg_blocked_asymmetric_gait",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return an asymmetric clock that starts only after a side is blocked.
+
+    The blocked side enters swing immediately while the other side remains in
+    stance. When no side is blocked, the clock resets and all outputs are zero.
+    """
+
+    swing_fraction = min(max(swing_fraction, 1.0e-3), 0.49)
+    dt_ratio = env.step_dt / max(gait_period, 1.0e-6)
+    blocked_left = blocked_gate[:, 0] > 0.0
+    blocked_right = (blocked_gate[:, 1] > 0.0) & ~blocked_left
+    blocked_active = blocked_left | blocked_right
+    blocked_side = torch.full((env.num_envs,), -1, dtype=torch.int32, device=env.device)
+    blocked_side[blocked_left] = 0
+    blocked_side[blocked_right] = 1
+    start_cycle = torch.zeros(env.num_envs, device=env.device)
+
+    phase_attr = f"{state_prefix}_cycle"
+    active_attr = f"{state_prefix}_active"
+    side_attr = f"{state_prefix}_side"
+    step_attr = f"{state_prefix}_step"
+    if not hasattr(env, phase_attr):
+        setattr(env, phase_attr, torch.zeros(env.num_envs, dtype=torch.float32, device=env.device))
+        setattr(env, active_attr, torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+        setattr(env, side_attr, torch.full((env.num_envs,), -1, dtype=torch.int32, device=env.device))
+        setattr(env, step_attr, -1)
+
+    cycle = getattr(env, phase_attr)
+    active = getattr(env, active_attr)
+    side = getattr(env, side_attr)
+    current_step = int(env.common_step_counter)
+    if getattr(env, step_attr) != current_step:
+        reset_mask = env.episode_length_buf <= 1
+        side_changed = blocked_active & (side != blocked_side)
+        newly_active = blocked_active & ((~active) | side_changed)
+        continuing = blocked_active & (~newly_active)
+
+        cycle = torch.where(continuing, torch.remainder(cycle + dt_ratio, 1.0), cycle)
+        cycle = torch.where(newly_active, start_cycle, cycle)
+        cycle = torch.where(blocked_active & (~reset_mask), cycle, torch.zeros_like(cycle))
+        active = blocked_active & (~reset_mask)
+        side = torch.where(active, blocked_side, torch.full_like(side, -1))
+
+        setattr(env, phase_attr, cycle)
+        setattr(env, active_attr, active)
+        setattr(env, side_attr, side)
+        setattr(env, step_attr, current_step)
+
+    phase = 2.0 * math.pi * cycle
+    left_swing = ((cycle < swing_fraction) & active & (side == 0)).to(dtype=torch.float32)
+    right_swing = ((cycle < swing_fraction) & active & (side == 1)).to(dtype=torch.float32)
+    left_stance = ((active) & (left_swing <= 0.0)).to(dtype=torch.float32)
+    right_stance = ((active) & (right_swing <= 0.0)).to(dtype=torch.float32)
+    return phase, torch.sin(phase) * active.to(dtype=torch.float32), torch.cos(phase) * active.to(dtype=torch.float32), left_swing, right_swing, left_stance, right_stance
+
+
 def gait_phase_obs(env: ManagerBasedRLEnv, gait_period: float) -> torch.Tensor:
     """Return phase clock signals and swing/stance flags.
 
@@ -67,6 +152,50 @@ def gait_phase_obs(env: ManagerBasedRLEnv, gait_period: float) -> torch.Tensor:
         ),
         dim=-1,
     )
+
+
+def stage_asymmetric_gait_phase_obs(
+    env: ManagerBasedRLEnv,
+    stage: int | None = None,
+    gait_period: float = 0.8,
+    swing_fraction: float = 0.35,
+    blocked_latch_attr: str | None = None,
+    state_prefix: str = "wheelleg_blocked_asymmetric_gait",
+) -> torch.Tensor:
+    """Return a stage-gated asymmetric gait clock observation.
+
+    Observation layout:
+    [sin(phase), cos(phase), L_swing, R_swing, L_stance, R_stance].
+    """
+
+    if blocked_latch_attr is None:
+        _, phase_sin, phase_cos, left_swing, right_swing, left_stance, right_stance = asymmetric_gait_phase_mask(
+            env,
+            gait_period,
+            swing_fraction,
+        )
+    else:
+        blocked_gate = getattr(env, blocked_latch_attr, None)
+        if blocked_gate is None:
+            blocked_gate = torch.zeros(env.num_envs, 2, dtype=torch.float32, device=env.device)
+        _, phase_sin, phase_cos, left_swing, right_swing, left_stance, right_stance = blocked_asymmetric_gait_phase_mask(
+            env,
+            blocked_gate.to(dtype=torch.float32),
+            gait_period,
+            swing_fraction,
+            state_prefix,
+        )
+    obs = torch.stack((phase_sin, phase_cos, left_swing, right_swing, left_stance, right_stance), dim=-1)
+
+    if stage is None:
+        return obs
+
+    terrain = getattr(env.scene, "terrain", None)
+    terrain_types = getattr(terrain, "terrain_types", None)
+    if terrain_types is None:
+        return torch.zeros_like(obs)
+    stage_gate = (terrain_types == stage).to(dtype=torch.float32).unsqueeze(1)
+    return obs * stage_gate
 
 
 def _contact_body_ids(sensor: ContactSensor, sensor_cfg: SceneEntityCfg) -> list[int] | slice:
@@ -129,6 +258,28 @@ def contact_state_obs(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, thresh
     forces = contact_sensor_forces(env, sensor_cfg)
     contact = torch.linalg.norm(forces, dim=-1) > threshold
     return contact.to(dtype=torch.float32)
+
+
+def leg_link_contact_state_obs(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float,
+    links_per_side: int = 4,
+) -> torch.Tensor:
+    """Return left/right non-wheel leg-link contact state.
+
+    The configured body list is expected to contain all left-side leg links
+    first, then all right-side leg links. Observation layout:
+    [L_link_contact, R_link_contact].
+    """
+
+    contact = contact_state_obs(env, sensor_cfg, threshold)
+    if contact.shape[1] < 2 * links_per_side:
+        return torch.zeros(env.num_envs, 2, dtype=torch.float32, device=env.device)
+
+    left_contact = torch.amax(contact[:, :links_per_side], dim=1)
+    right_contact = torch.amax(contact[:, links_per_side : 2 * links_per_side], dim=1)
+    return torch.stack((left_contact, right_contact), dim=1)
 
 
 def contact_last_air_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -205,6 +356,18 @@ def wheel_end_effector_state_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityC
     return planar_state.reshape(env.num_envs, -1)
 
 
+def foot_height_scan(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, offset: float = 0.5) -> torch.Tensor:
+    """Return a foot-local terrain height scan from a ray-caster sensor.
+
+    The output is the scanner height minus each terrain hit height, with a
+    constant offset subtracted to keep values centered around flat terrain.
+    """
+
+    sensor = env.scene.sensors[sensor_cfg.name]
+    heights = sensor.data.pos_w[:, 2].unsqueeze(1) - sensor.data.ray_hits_w[..., 2] - offset
+    return torch.nan_to_num(heights, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def action_history_obs(env: ManagerBasedRLEnv, history_length: int = 5) -> torch.Tensor:
     """Return a short history of recently applied actions.
 
@@ -232,6 +395,46 @@ def action_history_obs(env: ManagerBasedRLEnv, history_length: int = 5) -> torch
         env.wheelleg_action_history_step = current_step
 
     return env.wheelleg_action_history.reshape(env.num_envs, -1)
+
+
+def velocity_tracking_error_history_obs(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    history_length: int = 5,
+) -> torch.Tensor:
+    """Return recent body-frame XY velocity tracking errors.
+
+    Observation layout per frame:
+    [cmd_vx - base_vx, cmd_vy - base_vy, ||cmd_xy - base_xy||].
+    The newest frame is stored first, so a policy can compare the current error
+    against the previous few control steps and infer sudden blocking.
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    command_xy = env.command_manager.get_command(command_name)[:, :2]
+    error_xy = command_xy - asset.data.root_lin_vel_b[:, :2]
+    error_norm = torch.linalg.norm(error_xy, dim=1, keepdim=True)
+    error_frame = torch.cat((error_xy, error_norm), dim=1)
+    frame_dim = error_frame.shape[1]
+
+    needs_init = not hasattr(env, "wheelleg_velocity_error_history")
+    if not needs_init:
+        needs_init = env.wheelleg_velocity_error_history.shape[1:] != (history_length, frame_dim)
+    if needs_init:
+        env.wheelleg_velocity_error_history = error_frame.unsqueeze(1).repeat(1, history_length, 1)
+        env.wheelleg_velocity_error_history_step = -1
+
+    reset_mask = env.episode_length_buf <= 1
+    env.wheelleg_velocity_error_history[reset_mask] = error_frame[reset_mask].unsqueeze(1)
+
+    current_step = int(env.common_step_counter)
+    if env.wheelleg_velocity_error_history_step != current_step:
+        env.wheelleg_velocity_error_history[:, 1:] = env.wheelleg_velocity_error_history[:, :-1].clone()
+        env.wheelleg_velocity_error_history[:, 0] = error_frame
+        env.wheelleg_velocity_error_history_step = current_step
+
+    return env.wheelleg_velocity_error_history.reshape(env.num_envs, -1)
 
 
 def base_height_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

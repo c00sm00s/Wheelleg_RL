@@ -1,0 +1,62 @@
+api_version: v1
+kind: DLCJob
+
+metadata:
+  name: yolo-coco8-dlc-test
+  project: brainco-yolo-demo
+
+spec:
+  # 可用镜像链接可以联系管理员获取，以下是和autodl私有云用的同样的镜像
+  image: ccr.ccs.tencentyun.com/autodl-private-cloud/torch:cuda12.8-cudnn-devel-ubuntu22.04-py312-torch2.8.0
+  resource_id: quota-4090 # 可选quota-4090 quota-a100
+  priority: 1 # 取值范围为[1，9]，其中1表示优先级最低
+  resources: # 设置所需要的gpu/cpu/ram
+    gpu: 1
+    cpu: 16
+    memory_gb: 60
+
+  code:
+    project_path: . # 代码相对路径，该路径下文件自动打包上传oss，任务容器自动拉取
+    exclude: # 代码打包排除的路径
+      - .git
+      - outputs
+    use_gitignore: true # 开启 .gitignore 过滤
+    gitignore_include: # 即使被 .gitignore 匹配也保留的路径
+      - build/weights
+      - "*.so"
+
+  # 额外上传的小数据集/测试数据（可选）。每个 local 单独打包上传，
+  # 容器内代码解压后再解压到对应 target，适合小体量数据或调试样本。
+  # extra_uploads:
+  #   - local: ./test_data        # 本地文件或目录，相对本 job.yaml 解析
+  #     target: /workspace/data   # 容器内解压目标目录
+
+  runtime:
+    workdir: /workspace/code
+    entrypoint: train.sh
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple
+      PIP_DEFAULT_TIMEOUT: "1800"
+
+  storage:
+    mounts:
+      - name: output
+        type: oss
+        # 输出写回oss的基础路径，自动挂载到下面target路径
+        source: oss://oss-pai-wulanchabu-stark/bctrainctl/output/yolo-coco8-oss
+        # 训练任务脚本需要把输出写到如下路径
+        target: /workspace/output
+        read_only: false
+      - name: data-oss
+        type: oss
+        # 默认OSS数据盘挂载
+        source: oss://oss-pai-wulanchabu-stark.oss-cn-wulanchabu-internal.aliyuncs.com/
+        target: /mnt/data_oss
+        read_only: false
+      - name: data-nas
+        type: nas
+        # 默认NAS文件系统挂载
+        source: nas://29377a494cb-afl20.cn-wulanchabu.nas.aliyuncs.com/
+        target: /mnt/data_nas/
+        read_only: false

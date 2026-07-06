@@ -15,6 +15,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, wrap_to_pi
 
 from .observations import (
+    blocked_asymmetric_gait_phase_mask,
     contact_first_contact,
     contact_last_air_time,
     contact_sensor_forces,
@@ -72,6 +73,22 @@ def wheel_not_stop_penalty(
     return (should_roll & is_stopped).to(dtype=torch.float32)
 
 
+def joint_power_l1(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize absolute mechanical joint power."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    torque = asset.data.applied_torque[:, asset_cfg.joint_ids]
+    joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(torque * joint_vel), dim=1)
+
+
+def undesired_contacts_count(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float = 1.0) -> torch.Tensor:
+    """Count selected bodies whose contact force exceeds the threshold."""
+
+    force_norm = torch.linalg.norm(contact_sensor_forces(env, sensor_cfg), dim=-1)
+    return torch.sum((force_norm > threshold).to(dtype=torch.float32), dim=1)
+
+
 def _terrain_stage_gate(env: ManagerBasedRLEnv, min_stage: int) -> torch.Tensor:
     """Return 1.0 for envs currently at or above ``min_stage``."""
 
@@ -80,6 +97,56 @@ def _terrain_stage_gate(env: ManagerBasedRLEnv, min_stage: int) -> torch.Tensor:
     if terrain_types is None:
         return torch.ones(env.num_envs, device=env.device)
     return (terrain_types >= min_stage).to(dtype=torch.float32, device=env.device)
+
+
+def stage_track_lin_vel_xy_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    min_stage: int,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Stage-gated XY velocity tracking bonus."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    lin_vel_error = torch.sum(torch.square(command[:, :2] - asset.data.root_lin_vel_b[:, :2]), dim=1)
+    return _terrain_stage_gate(env, min_stage) * torch.exp(-lin_vel_error / (std * std))
+
+
+def stage_track_ang_vel_z_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    min_stage: int,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Stage-gated yaw-rate tracking bonus."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    ang_vel_error = torch.square(command[:, 2] - asset.data.root_ang_vel_b[:, 2])
+    return _terrain_stage_gate(env, min_stage) * torch.exp(-ang_vel_error / (std * std))
+
+
+def stage3_heading_alignment_reward(
+    env: ManagerBasedRLEnv,
+    stage: int,
+    target_heading: float = 0.0,
+    std: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward stage3 base heading alignment with the uphill direction."""
+
+    terrain = getattr(env.scene, "terrain", None)
+    terrain_types = getattr(terrain, "terrain_types", None)
+    if terrain_types is None:
+        return torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    heading_error = wrap_to_pi(target_heading - asset.data.heading_w)
+    reward = torch.exp(-torch.square(heading_error) / (std * std))
+    return (terrain_types == stage).to(dtype=torch.float32) * reward
 
 
 def leg_joint_motion_reward(
@@ -385,19 +452,130 @@ def _wheel_terrain_clearance(
     right_sensor_cfg: SceneEntityCfg,
     wheel_radius: float,
 ) -> torch.Tensor:
-    """Return terrain-relative wheel bottom clearance for left/right wheels."""
+    """Return left/right wheel-bottom height above ray-observed terrain."""
 
     asset: Articulation = env.scene[asset_cfg.name]
-    wheel_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    wheel_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    wheel_bottom_z = wheel_pos_w[..., 2] - wheel_radius
 
-    left_sensor = env.scene.sensors[left_sensor_cfg.name]
-    right_sensor = env.scene.sensors[right_sensor_cfg.name]
-    left_hit_z = torch.mean(left_sensor.data.ray_hits_w[..., 2], dim=1)
-    right_hit_z = torch.mean(right_sensor.data.ray_hits_w[..., 2], dim=1)
-    hit_z = torch.stack((left_hit_z, right_hit_z), dim=1)
-    hit_z = torch.nan_to_num(hit_z, nan=0.0, posinf=0.0, neginf=0.0)
+    clearances = []
+    for wheel_id, sensor_cfg in enumerate((left_sensor_cfg, right_sensor_cfg)):
+        sensor = env.scene.sensors[sensor_cfg.name]
+        ray_hits_w = sensor.data.ray_hits_w
+        finite_hit = torch.isfinite(ray_hits_w).all(dim=-1)
+        ray_xy = torch.nan_to_num(ray_hits_w[..., :2], nan=0.0, posinf=0.0, neginf=0.0)
+        wheel_xy = wheel_pos_w[:, wheel_id, :2].unsqueeze(1)
+        dist_sq = torch.sum(torch.square(ray_xy - wheel_xy), dim=-1)
+        dist_sq = torch.where(finite_hit, dist_sq, torch.full_like(dist_sq, float("inf")))
+        nearest_ray_id = torch.argmin(dist_sq, dim=1)
+        hit_z = torch.gather(
+            torch.nan_to_num(ray_hits_w[..., 2], nan=0.0, posinf=0.0, neginf=0.0),
+            dim=1,
+            index=nearest_ray_id.unsqueeze(1),
+        ).squeeze(1)
+        has_hit = torch.any(finite_hit, dim=1)
+        ground_z = torch.where(has_hit, hit_z, wheel_bottom_z[:, wheel_id])
+        clearances.append(wheel_bottom_z[:, wheel_id] - ground_z)
 
-    return wheel_z - hit_z - wheel_radius
+    return torch.stack(clearances, dim=1)
+
+
+def wheel_clearance_difference_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    left_sensor_cfg: SceneEntityCfg,
+    right_sensor_cfg: SceneEntityCfg,
+    wheel_radius: float = 0.0625,
+    min_stage: int = 2,
+    deadband: float = 0.16,
+    std: float = 0.05,
+) -> torch.Tensor:
+    """Penalize extreme left/right wheel-bottom height difference."""
+
+    clearance = _wheel_terrain_clearance(env, asset_cfg, left_sensor_cfg, right_sensor_cfg, wheel_radius)
+    difference = torch.abs(clearance[:, 0] - clearance[:, 1])
+    excess = torch.relu(difference - deadband) / max(std, 1.0e-6)
+    return _terrain_stage_gate(env, min_stage) * torch.square(excess)
+
+
+def _side_link_contact(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg | None, threshold: float, links_per_side: int = 4) -> torch.Tensor:
+    """Return left/right non-wheel leg-link contact state."""
+
+    if sensor_cfg is None:
+        return torch.zeros(env.num_envs, 2, dtype=torch.float32, device=env.device)
+    contact = contact_state_obs(env, sensor_cfg, threshold)
+    if contact.shape[1] < 2 * links_per_side:
+        return torch.zeros(env.num_envs, 2, dtype=torch.float32, device=env.device)
+    left_contact = torch.amax(contact[:, :links_per_side], dim=1)
+    right_contact = torch.amax(contact[:, links_per_side : 2 * links_per_side], dim=1)
+    return torch.stack((left_contact, right_contact), dim=1)
+
+
+def _wheel_bottom_lift_from_reset_height(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+) -> torch.Tensor:
+    """Return left/right wheel-bottom lift relative to reset pose in base frame."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    num_wheels = wheel_pos_w.shape[1]
+    root_pos_w = asset.data.root_pos_w.unsqueeze(1)
+    root_quat_w = asset.data.root_quat_w.unsqueeze(1).expand(-1, num_wheels, -1).reshape(-1, 4)
+    rel_pos_b = quat_apply_inverse(root_quat_w, (wheel_pos_w - root_pos_w).reshape(-1, 3)).view(env.num_envs, num_wheels, 3)
+    bottom_rel_z = rel_pos_b[..., 2] - wheel_radius
+
+    needs_init = not hasattr(env, "wheelleg_wheel_bottom_rel_z_reference")
+    if not needs_init:
+        needs_init = env.wheelleg_wheel_bottom_rel_z_reference.shape != bottom_rel_z.shape
+    if needs_init:
+        env.wheelleg_wheel_bottom_rel_z_reference = bottom_rel_z.clone()
+
+    reset_mask = env.episode_length_buf <= 1
+    env.wheelleg_wheel_bottom_rel_z_reference[reset_mask] = bottom_rel_z[reset_mask]
+    return bottom_rel_z - env.wheelleg_wheel_bottom_rel_z_reference
+
+
+def _stage3_stair_surface_height(
+    sample_x: torch.Tensor,
+    bottom_platform_width: float,
+    step_height: float,
+    step_width: float,
+    num_steps: int,
+) -> torch.Tensor:
+    """Return straight-stair surface height under each x sample."""
+
+    stair_start_x = 0.5 * bottom_platform_width
+    stair_end_x = stair_start_x + num_steps * step_width
+    progress = torch.clamp(sample_x - stair_start_x, min=0.0, max=num_steps * step_width)
+    active_step = torch.clamp(torch.floor(progress / step_width) + 1.0, min=1.0, max=float(num_steps))
+    surface_z = torch.where(sample_x < stair_start_x, torch.zeros_like(sample_x), active_step * step_height)
+    return torch.where(sample_x > stair_end_x, torch.full_like(sample_x, num_steps * step_height), surface_z)
+
+
+def _wheel_bottom_clearance_from_stage3_surface(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    bottom_platform_width: float,
+    step_height: float,
+    step_width: float,
+    num_steps: int,
+    wheel_radius: float,
+) -> torch.Tensor:
+    """Return left/right wheel-bottom clearance above the straight-stair surface."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :] - env.scene.terrain.env_origins.unsqueeze(1)
+    wheel_bottom_z = wheel_pos[..., 2] - wheel_radius
+    surface_z = _stage3_stair_surface_height(
+        wheel_pos[..., 0],
+        bottom_platform_width,
+        step_height,
+        step_width,
+        num_steps,
+    )
+    return wheel_bottom_z - surface_z
 
 
 def gait_alternating_contact_reward(
@@ -527,6 +705,581 @@ def gait_lateral_drift_penalty(
     asset: Articulation = env.scene[asset_cfg.name]
     moving_gate = _moving_command_gate(env, command_name, min_command_speed)
     return moving_gate * torch.square(asset.data.root_lin_vel_b[:, 1])
+
+
+def _history_blocked_wheel_gate(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    link_sensor_cfg: SceneEntityCfg | None,
+    history_length: int,
+    min_command_speed: float,
+    contact_threshold: float,
+    blocked_memory_steps: int,
+    wheel_velocity_error_threshold: float = 0.25,
+    min_blocked_stage: int | None = None,
+    horizontal_force_ratio_threshold: float = 0.4,
+    horizontal_force_threshold: float = 1.0,
+    wheel_joint_names: tuple[str, ...] | None = ("L_wheel_joint", "R_wheel_joint"),
+    wheel_spin_radius: float = 0.0625,
+    wheel_spin_speed_threshold: float = 0.5,
+    wheel_spin_forward_speed_threshold: float = 0.12,
+) -> torch.Tensor:
+    """Detect which wheel is likely blocked from wheel-link velocity history.
+
+    A side is treated as blocked when a target XY velocity exists and that
+    side's wheel-link translational velocity has failed to track the target
+    over the recent history window while the wheel is loaded, when wheel contact
+    force has a large horizontal component that suggests impact against a
+    vertical obstacle, or when the wheel spins quickly without forward progress.
+    Non-wheel leg-link contact also directly marks that side as blocked. A
+    short latch keeps the signal alive after contact breaks, otherwise the lift
+    reward would disappear exactly when the policy starts doing the right thing.
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    command_xy = command[:, :2]
+    command_speed = torch.linalg.norm(command_xy, dim=1)
+
+    error_history_len = max(history_length, 3)
+    body_vel_w = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]
+    root_quat_w = asset.data.root_quat_w.unsqueeze(1).expand(-1, body_vel_w.shape[1], -1).reshape(-1, 4)
+    body_vel_b = quat_apply_inverse(root_quat_w, body_vel_w.reshape(-1, 3)).view(env.num_envs, body_vel_w.shape[1], 3)
+    wheel_velocity_error = torch.linalg.norm(body_vel_b[..., :2] - command_xy.unsqueeze(1), dim=-1)
+
+    needs_error_history = not hasattr(env, "wheelleg_wheel_velocity_error_history")
+    if not needs_error_history:
+        needs_error_history = env.wheelleg_wheel_velocity_error_history.shape[1:] != (
+            error_history_len,
+            wheel_velocity_error.shape[1],
+        )
+    if needs_error_history:
+        env.wheelleg_wheel_velocity_error_history = wheel_velocity_error.unsqueeze(1).repeat(1, error_history_len, 1)
+        env.wheelleg_wheel_velocity_error_history_step = -1
+
+    reset_mask = env.episode_length_buf <= 1
+    env.wheelleg_wheel_velocity_error_history[reset_mask] = wheel_velocity_error[reset_mask].unsqueeze(1)
+
+    current_step = int(env.common_step_counter)
+    if env.wheelleg_wheel_velocity_error_history_step != current_step:
+        env.wheelleg_wheel_velocity_error_history[:, 1:] = env.wheelleg_wheel_velocity_error_history[:, :-1].clone()
+        env.wheelleg_wheel_velocity_error_history[:, 0] = wheel_velocity_error
+        env.wheelleg_wheel_velocity_error_history_step = current_step
+
+    wheel_velocity_error_mean = torch.mean(env.wheelleg_wheel_velocity_error_history, dim=1)
+    wheel_velocity_blocked = wheel_velocity_error_mean > wheel_velocity_error_threshold
+
+    wheel_contact = contact_state_obs(env, sensor_cfg, contact_threshold)
+    wheel_force = contact_sensor_forces(env, sensor_cfg)
+    wheel_horizontal_force = torch.linalg.norm(wheel_force[..., :2], dim=-1)
+    wheel_vertical_force = torch.abs(wheel_force[..., 2])
+    wheel_horizontal_ratio = wheel_horizontal_force / torch.clamp(wheel_vertical_force, min=1.0e-6)
+    wheel_horizontal_blocked = (wheel_contact > 0.5) & (wheel_horizontal_force > horizontal_force_threshold)
+    wheel_horizontal_blocked &= wheel_horizontal_ratio > horizontal_force_ratio_threshold
+    wheel_spin_blocked = torch.zeros_like(wheel_horizontal_blocked)
+    if wheel_joint_names is not None:
+        wheel_joint_ids, _ = asset.find_joints(list(wheel_joint_names), preserve_order=True)
+        if len(wheel_joint_ids) == wheel_contact.shape[1]:
+            wheel_surface_speed = torch.abs(asset.data.joint_vel[:, wheel_joint_ids]) * wheel_spin_radius
+            command_dir = command_xy / torch.clamp(command_speed.unsqueeze(1), min=1.0e-6)
+            wheel_forward_speed = torch.sum(body_vel_b[..., :2] * command_dir.unsqueeze(1), dim=-1)
+            base_forward_speed = torch.sum(asset.data.root_lin_vel_b[:, :2] * command_dir, dim=-1).unsqueeze(1)
+            forward_too_slow = (wheel_forward_speed < wheel_spin_forward_speed_threshold) | (
+                base_forward_speed < wheel_spin_forward_speed_threshold
+            )
+            wheel_spin_blocked = (wheel_contact > 0.5) & (wheel_surface_speed > wheel_spin_speed_threshold)
+            wheel_spin_blocked &= forward_too_slow
+    link_contact = _side_link_contact(env, link_sensor_cfg, contact_threshold)
+    settled = env.episode_length_buf > history_length
+
+    moving = (command_speed > min_command_speed).unsqueeze(1)
+    wheel_blocked = (wheel_velocity_blocked | wheel_horizontal_blocked | wheel_spin_blocked) & (wheel_contact > 0.5)
+    link_blocked = link_contact > 0.5
+    stage_active = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    if min_blocked_stage is not None:
+        terrain = getattr(env.scene, "terrain", None)
+        terrain_types = getattr(terrain, "terrain_types", None)
+        if terrain_types is None:
+            stage_active = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        else:
+            stage_active = terrain_types >= min_blocked_stage
+    raw_blocked = moving & (wheel_blocked | link_blocked) & settled.unsqueeze(1) & stage_active.unsqueeze(1)
+
+    latch_suffix = "all" if min_blocked_stage is None else f"min_stage_{min_blocked_stage}"
+    latch_attr = f"wheelleg_blocked_wheel_latch_{latch_suffix}"
+    latch_step_attr = f"{latch_attr}_step"
+    if not hasattr(env, latch_attr):
+        setattr(env, latch_attr, torch.zeros(env.num_envs, 2, dtype=torch.int32, device=env.device))
+        setattr(env, latch_step_attr, -1)
+
+    reset_mask = env.episode_length_buf <= 1
+    latch = getattr(env, latch_attr)
+    latch[reset_mask] = 0
+    latch[~stage_active] = 0
+    current_step = int(env.common_step_counter)
+    if getattr(env, latch_step_attr) != current_step:
+        latch = torch.clamp(latch - 1, min=0)
+        inactive = torch.sum(latch, dim=1) <= 0
+        new_blocked = raw_blocked & inactive.unsqueeze(1)
+        left_first = new_blocked[:, 0]
+        right_first = new_blocked[:, 1] & ~left_first
+        latch[left_first, 0] = blocked_memory_steps
+        latch[right_first, 1] = blocked_memory_steps
+        setattr(env, latch_attr, latch)
+        setattr(env, latch_step_attr, current_step)
+
+    return (getattr(env, latch_attr) > 0).to(dtype=torch.float32)
+
+
+def stage_blocked_asymmetric_wheel_lift_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    stage: int,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    link_sensor_cfg: SceneEntityCfg | None = None,
+    left_sensor_cfg: SceneEntityCfg | None = None,
+    right_sensor_cfg: SceneEntityCfg | None = None,
+    gait_period: float = 0.8,
+    swing_fraction: float = 0.35,
+    history_length: int = 5,
+    min_command_speed: float = 0.1,
+    contact_threshold: float = 1.0,
+    wheel_velocity_error_threshold: float = 0.25,
+    horizontal_force_ratio_threshold: float = 0.4,
+    horizontal_force_threshold: float = 1.0,
+    height_margin: float = 0.03,
+    height_std: float = 0.03,
+    wheel_radius: float = 0.0625,
+    wheel_spin_speed_threshold: float = 0.5,
+    wheel_spin_forward_speed_threshold: float = 0.12,
+    min_base_height: float = 0.42,
+    base_height_std: float = 0.05,
+    min_forward_speed: float = 0.08,
+    max_lift_height: float = 0.16,
+    max_wheel_clearance_difference: float = 0.20,
+    height_weight: float = 1.0,
+    air_weight: float = 0.7,
+    support_contact_weight: float = 0.3,
+    state_prefix: str = "wheelleg_blocked_asymmetric_gait",
+) -> torch.Tensor:
+    """Reward a blocked robot for an asymmetric lift step on one wheel.
+
+    The reward is active only on the selected stage when the blocked side is in
+    swing. If foot ray sensors are provided, lift is the swing wheel-bottom
+    height above ray-observed terrain; otherwise it falls back to comparing the
+    swing wheel center height against the stance wheel center height.
+    """
+
+    terrain = getattr(env.scene, "terrain", None)
+    terrain_types = getattr(terrain, "terrain_types", None)
+    if terrain_types is None:
+        return torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+
+    blocked_gate = _history_blocked_wheel_gate(
+        env,
+        command_name,
+        asset_cfg,
+        sensor_cfg,
+        link_sensor_cfg,
+        history_length,
+        min_command_speed,
+        contact_threshold,
+        blocked_memory_steps=30,
+        wheel_velocity_error_threshold=wheel_velocity_error_threshold,
+        min_blocked_stage=stage,
+        horizontal_force_ratio_threshold=horizontal_force_ratio_threshold,
+        horizontal_force_threshold=horizontal_force_threshold,
+        wheel_spin_radius=wheel_radius,
+        wheel_spin_speed_threshold=wheel_spin_speed_threshold,
+        wheel_spin_forward_speed_threshold=wheel_spin_forward_speed_threshold,
+    )
+    stage_gate = terrain_types == stage
+    _, _, _, left_swing, right_swing, _, _ = blocked_asymmetric_gait_phase_mask(
+        env,
+        blocked_gate,
+        gait_period,
+        swing_fraction,
+        state_prefix,
+    )
+    active_blocked_swing = torch.clamp(
+        left_swing * blocked_gate[:, 0] + right_swing * blocked_gate[:, 1],
+        max=1.0,
+    )
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    if left_sensor_cfg is not None and right_sensor_cfg is not None:
+        clearance = _wheel_terrain_clearance(env, asset_cfg, left_sensor_cfg, right_sensor_cfg, wheel_radius)
+        lift_height = left_swing * clearance[:, 0] + right_swing * clearance[:, 1]
+        wheel_height_difference = torch.abs(clearance[:, 0] - clearance[:, 1])
+    else:
+        wheel_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+        left_wheel_z = wheel_z[:, 0]
+        right_wheel_z = wheel_z[:, 1]
+        swing_z = left_swing * left_wheel_z + right_swing * right_wheel_z
+        stance_z = left_swing * right_wheel_z + right_swing * left_wheel_z
+        lift_height = swing_z - stance_z
+        wheel_height_difference = torch.abs(left_wheel_z - right_wheel_z)
+    height_reward = torch.exp(-torch.square(torch.relu(height_margin - lift_height)) / (height_std * height_std))
+    over_lift_gate = torch.exp(-torch.square(torch.relu(lift_height - max_lift_height)) / (height_std * height_std))
+    split_gate = torch.exp(
+        -torch.square(torch.relu(wheel_height_difference - max_wheel_clearance_difference)) / (height_std * height_std)
+    )
+
+    command_dir = env.command_manager.get_command(command_name)[:, :2]
+    command_speed = torch.linalg.norm(command_dir, dim=1)
+    command_dir = command_dir / torch.clamp(command_speed.unsqueeze(1), min=1.0e-6)
+    forward_speed = torch.sum(asset.data.root_lin_vel_b[:, :2] * command_dir, dim=1)
+    forward_gate = torch.clamp(forward_speed / max(min_forward_speed, 1.0e-6), min=0.0, max=1.0)
+    base_height_gate = torch.exp(
+        -torch.square(torch.relu(min_base_height - asset.data.root_pos_w[:, 2])) / (base_height_std * base_height_std)
+    )
+
+    wheel_contact = contact_state_obs(env, sensor_cfg, contact_threshold)
+    swing_contact = left_swing * wheel_contact[:, 0] + right_swing * wheel_contact[:, 1]
+    stance_contact = left_swing * wheel_contact[:, 1] + right_swing * wheel_contact[:, 0]
+    air_reward = 1.0 - swing_contact
+
+    total_weight = max(height_weight + air_weight + support_contact_weight, 1.0e-6)
+    reward = (
+        height_weight * height_reward
+        + air_weight * air_reward
+        + support_contact_weight * stance_contact
+    ) / total_weight
+    return (
+        stage_gate.to(dtype=torch.float32)
+        * active_blocked_swing
+        * reward
+        * base_height_gate
+        * forward_gate
+        * over_lift_gate
+        * split_gate
+    )
+
+
+def _stage3_wheel_completed_steps(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    bottom_platform_width: float,
+    step_height: float,
+    step_width: float,
+    num_steps: int,
+    wheel_radius: float,
+    height_margin: float,
+) -> torch.Tensor:
+    """Return confirmed left/right stair step indices from wheel position and height."""
+
+    terrain = env.scene.terrain
+    stair_start_x = 0.5 * bottom_platform_width
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :] - terrain.env_origins.unsqueeze(1)
+    wheel_x = wheel_pos[..., 0]
+    wheel_bottom_z = wheel_pos[..., 2] - wheel_radius
+
+    progress = torch.clamp(wheel_x - stair_start_x, min=0.0, max=num_steps * step_width)
+    wheel_steps = torch.clamp(torch.floor(progress / step_width) + 1.0, min=1.0, max=float(num_steps))
+    wheel_steps = torch.where(wheel_x < stair_start_x, torch.zeros_like(wheel_steps), wheel_steps)
+    required_surface_z = wheel_steps * step_height
+    wheel_on_step = torch.abs(wheel_bottom_z - required_surface_z) <= height_margin
+    return torch.where(wheel_on_step, wheel_steps, torch.zeros_like(wheel_steps))
+
+
+def stage3_stair_progress_reward(
+    env: ManagerBasedRLEnv,
+    stage: int,
+    bottom_platform_width: float,
+    step_height: float,
+    step_width: float,
+    num_steps: int,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=["L_wheel_link", "R_wheel_link"]),
+    wheel_radius: float = 0.0625,
+    height_margin: float = 0.04,
+) -> torch.Tensor:
+    """Reward stair progress only after both wheel-legs reach a new step."""
+
+    terrain = getattr(env.scene, "terrain", None)
+    terrain_types = getattr(terrain, "terrain_types", None)
+    if terrain_types is None:
+        return torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+
+    wheel_steps = _stage3_wheel_completed_steps(
+        env,
+        asset_cfg,
+        bottom_platform_width,
+        step_height,
+        step_width,
+        num_steps,
+        wheel_radius,
+        height_margin,
+    )
+    completed_steps = torch.amin(wheel_steps, dim=1)
+    stage_gate = terrain_types == stage
+
+    if not hasattr(env, "wheelleg_stage3_completed_steps"):
+        env.wheelleg_stage3_completed_steps = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+
+    reset_mask = env.episode_length_buf <= 1
+    env.wheelleg_stage3_completed_steps[reset_mask] = 0.0
+
+    previous_steps = env.wheelleg_stage3_completed_steps
+    new_steps = torch.relu(completed_steps - previous_steps) * stage_gate.to(dtype=torch.float32)
+    env.wheelleg_stage3_completed_steps = torch.maximum(
+        previous_steps,
+        completed_steps * stage_gate.to(dtype=torch.float32),
+    )
+    return new_steps
+
+
+def stage3_split_stair_lagging_lift_reward(
+    env: ManagerBasedRLEnv,
+    stage: int,
+    bottom_platform_width: float,
+    step_height: float,
+    step_width: float,
+    num_steps: int,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=["L_wheel_link", "R_wheel_link"]),
+    left_sensor_cfg: SceneEntityCfg | None = None,
+    right_sensor_cfg: SceneEntityCfg | None = None,
+    wheel_radius: float = 0.0625,
+    height_margin: float = 0.04,
+    lift_height: float = 0.125,
+    std: float = 0.05,
+) -> torch.Tensor:
+    """Reward lifting the lagging wheel when the other wheel has climbed a step."""
+
+    terrain = getattr(env.scene, "terrain", None)
+    terrain_types = getattr(terrain, "terrain_types", None)
+    if terrain_types is None:
+        return torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+
+    wheel_steps = _stage3_wheel_completed_steps(
+        env,
+        asset_cfg,
+        bottom_platform_width,
+        step_height,
+        step_width,
+        num_steps,
+        wheel_radius,
+        height_margin,
+    )
+    stage_gate = terrain_types == stage
+    left_lagging = stage_gate & (wheel_steps[:, 1] > wheel_steps[:, 0])
+    right_lagging = stage_gate & (wheel_steps[:, 0] > wheel_steps[:, 1])
+
+    if left_sensor_cfg is not None and right_sensor_cfg is not None:
+        clearance = _wheel_terrain_clearance(
+            env,
+            asset_cfg,
+            left_sensor_cfg,
+            right_sensor_cfg,
+            wheel_radius,
+        )
+    else:
+        clearance = _wheel_bottom_clearance_from_stage3_surface(
+            env,
+            asset_cfg,
+            bottom_platform_width,
+            step_height,
+            step_width,
+            num_steps,
+            wheel_radius,
+        )
+    left_reward = torch.exp(-torch.square(torch.relu(lift_height - clearance[:, 0])) / (std * std))
+    right_reward = torch.exp(-torch.square(torch.relu(lift_height - clearance[:, 1])) / (std * std))
+    active_count = torch.clamp(left_lagging.to(dtype=torch.float32) + right_lagging.to(dtype=torch.float32), min=1.0)
+    reward = left_lagging.to(dtype=torch.float32) * left_reward + right_lagging.to(dtype=torch.float32) * right_reward
+    return reward / active_count
+
+
+def history_blocked_swing_clearance_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    link_sensor_cfg: SceneEntityCfg | None = None,
+    gait_period: float = 0.8,
+    history_length: int = 5,
+    lift_height: float = 0.12,
+    std: float = 0.05,
+    wheel_radius: float = 0.0625,
+    left_sensor_cfg: SceneEntityCfg | None = None,
+    right_sensor_cfg: SceneEntityCfg | None = None,
+    stage: int | None = None,
+    bottom_platform_width: float = 2.0,
+    step_height: float = 0.08,
+    step_width: float = 0.35,
+    num_steps: int = 10,
+    min_blocked_stage: int | None = None,
+    min_command_speed: float = 0.1,
+    contact_threshold: float = 1.0,
+    wheel_velocity_error_threshold: float = 0.25,
+    horizontal_force_ratio_threshold: float = 0.4,
+    horizontal_force_threshold: float = 1.0,
+    wheel_spin_speed_threshold: float = 0.5,
+    wheel_spin_forward_speed_threshold: float = 0.12,
+) -> torch.Tensor:
+    """Reward wheel-link lift when base tracking or link contact indicates a block.
+
+    This is global across all curriculum stages. It does not force every step to
+    be high; it only becomes active when the robot is blocked. When foot ray
+    sensors are provided, lift is wheel-bottom clearance above the ray-observed
+    terrain; otherwise it falls back to reset-relative lift or analytic stage3
+    stair clearance.
+    """
+
+    blocked_gate = _history_blocked_wheel_gate(
+        env,
+        command_name,
+        asset_cfg,
+        sensor_cfg,
+        link_sensor_cfg,
+        history_length,
+        min_command_speed,
+        contact_threshold,
+        blocked_memory_steps=30,
+        wheel_velocity_error_threshold=wheel_velocity_error_threshold,
+        min_blocked_stage=min_blocked_stage,
+        horizontal_force_ratio_threshold=horizontal_force_ratio_threshold,
+        horizontal_force_threshold=horizontal_force_threshold,
+        wheel_spin_radius=wheel_radius,
+        wheel_spin_speed_threshold=wheel_spin_speed_threshold,
+        wheel_spin_forward_speed_threshold=wheel_spin_forward_speed_threshold,
+    )
+    lift = _wheel_bottom_lift_from_reset_height(env, asset_cfg, wheel_radius)
+    terrain = getattr(env.scene, "terrain", None)
+    terrain_types = getattr(terrain, "terrain_types", None)
+    if left_sensor_cfg is not None and right_sensor_cfg is not None:
+        ray_clearance = _wheel_terrain_clearance(
+            env,
+            asset_cfg,
+            left_sensor_cfg,
+            right_sensor_cfg,
+            wheel_radius,
+        )
+        if stage is not None and terrain_types is not None:
+            stage_mask = (terrain_types == stage).unsqueeze(1)
+            lift = torch.where(stage_mask, ray_clearance, lift)
+        else:
+            lift = ray_clearance
+    elif stage is not None and terrain_types is not None:
+        stage_clearance = _wheel_bottom_clearance_from_stage3_surface(
+            env,
+            asset_cfg,
+            bottom_platform_width,
+            step_height,
+            step_width,
+            num_steps,
+            wheel_radius,
+        )
+        stage_mask = (terrain_types == stage).unsqueeze(1)
+        lift = torch.where(stage_mask, stage_clearance, lift)
+
+    left_reward = torch.exp(-torch.square(torch.relu(lift_height - lift[:, 0])) / (std * std))
+    right_reward = torch.exp(-torch.square(torch.relu(lift_height - lift[:, 1])) / (std * std))
+    reward = torch.stack((left_reward, right_reward), dim=1)
+    blocked_count = torch.clamp(torch.sum(blocked_gate, dim=1), min=1.0)
+    return torch.sum(blocked_gate * reward, dim=1) / blocked_count
+
+
+def history_blocked_lift_velocity_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    link_sensor_cfg: SceneEntityCfg | None = None,
+    history_length: int = 5,
+    min_command_speed: float = 0.1,
+    contact_threshold: float = 1.0,
+    wheel_velocity_error_threshold: float = 0.25,
+    target_lift_speed: float = 0.35,
+    min_blocked_stage: int | None = None,
+    horizontal_force_ratio_threshold: float = 0.4,
+    horizontal_force_threshold: float = 1.0,
+    wheel_spin_radius: float = 0.0625,
+    wheel_spin_speed_threshold: float = 0.5,
+    wheel_spin_forward_speed_threshold: float = 0.12,
+) -> torch.Tensor:
+    """Reward upward wheel-link motion when base tracking history indicates a block.
+
+    This is an end-effector prior for the five-bar leg: it encourages the
+    blocked wheel to move upward relative to the base, but leaves the policy to
+    discover the hip-front/hip-rear coordination that produces that motion.
+    """
+
+    blocked_gate = _history_blocked_wheel_gate(
+        env,
+        command_name,
+        asset_cfg,
+        sensor_cfg,
+        link_sensor_cfg,
+        history_length,
+        min_command_speed,
+        contact_threshold,
+        blocked_memory_steps=30,
+        wheel_velocity_error_threshold=wheel_velocity_error_threshold,
+        min_blocked_stage=min_blocked_stage,
+        horizontal_force_ratio_threshold=horizontal_force_ratio_threshold,
+        horizontal_force_threshold=horizontal_force_threshold,
+        wheel_spin_radius=wheel_spin_radius,
+        wheel_spin_speed_threshold=wheel_spin_speed_threshold,
+        wheel_spin_forward_speed_threshold=wheel_spin_forward_speed_threshold,
+    )
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_vel_z = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, 2]
+    base_vel_z = asset.data.root_lin_vel_w[:, 2].unsqueeze(1)
+    relative_lift_speed = wheel_vel_z - base_vel_z
+    lift_progress = torch.clamp(relative_lift_speed / max(target_lift_speed, 1.0e-6), min=0.0, max=1.0)
+
+    blocked_count = torch.clamp(torch.sum(blocked_gate, dim=1), min=1.0)
+    return torch.sum(blocked_gate * lift_progress, dim=1) / blocked_count
+
+
+def history_blocked_drag_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    link_sensor_cfg: SceneEntityCfg | None = None,
+    gait_period: float = 0.8,
+    history_length: int = 5,
+    min_command_speed: float = 0.12,
+    contact_threshold: float = 1.0,
+    wheel_velocity_error_threshold: float = 0.25,
+    min_blocked_stage: int | None = None,
+    horizontal_force_ratio_threshold: float = 0.4,
+    horizontal_force_threshold: float = 1.0,
+    wheel_spin_radius: float = 0.0625,
+    wheel_spin_speed_threshold: float = 0.5,
+    wheel_spin_forward_speed_threshold: float = 0.12,
+) -> torch.Tensor:
+    """Penalize keeping the swing wheel loaded when history says it is blocked."""
+
+    blocked_gate = _history_blocked_wheel_gate(
+        env,
+        command_name,
+        asset_cfg,
+        sensor_cfg,
+        link_sensor_cfg,
+        history_length,
+        min_command_speed,
+        contact_threshold,
+        blocked_memory_steps=30,
+        wheel_velocity_error_threshold=wheel_velocity_error_threshold,
+        min_blocked_stage=min_blocked_stage,
+        horizontal_force_ratio_threshold=horizontal_force_ratio_threshold,
+        horizontal_force_threshold=horizontal_force_threshold,
+        wheel_spin_radius=wheel_spin_radius,
+        wheel_spin_speed_threshold=wheel_spin_speed_threshold,
+        wheel_spin_forward_speed_threshold=wheel_spin_forward_speed_threshold,
+    )
+    wheel_contact = contact_state_obs(env, sensor_cfg, contact_threshold)
+    link_contact = _side_link_contact(env, link_sensor_cfg, contact_threshold)
+    contact = torch.maximum(wheel_contact, link_contact)
+    blocked_count = torch.clamp(torch.sum(blocked_gate, dim=1), min=1.0)
+    return torch.sum(blocked_gate * contact, dim=1) / blocked_count
 
 
 def hip_action_sync_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
